@@ -1,0 +1,11 @@
+browser-use
+playwright
+gspread
+google-auth
+google-auth-oauthlib
+pdfplumber
+python-docx
+requests
+pandas
+python-dotenv
+langchain-ollama

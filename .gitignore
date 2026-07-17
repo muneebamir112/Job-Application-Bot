@@ -1,0 +1,14 @@
+# Credentials
+service_account.json
+.env
+
+# User data
+resume/
+!resume/.gitkeep
+profile.json
+
+# Local logs and output
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
