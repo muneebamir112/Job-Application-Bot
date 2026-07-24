@@ -4,11 +4,13 @@ import time
 import config
 from modules.logger import logger
 
-def query_ollama(prompt: str, system_prompt: str = "", timeout: int = 30) -> str:
+def query_ollama(prompt: str, system_prompt: str = "", timeout: int = None) -> str:
     """
     Sends a generation prompt to the local Ollama API.
     Handles retries and connection failures gracefully.
     """
+    if timeout is None:
+        timeout = config.OLLAMA_TIMEOUT
     url = f"{config.OLLAMA_HOST}/api/generate"
     payload = {
         "model": config.OLLAMA_MODEL,

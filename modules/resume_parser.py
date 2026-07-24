@@ -26,8 +26,30 @@ PROFILE_TEMPLATE = {
     "salary_expectation": "",
     "notice_period": "",
     "willing_to_relocate": "",
-    "resume_file_path": ""
+    "resume_file_path": "",
+    "resume_text": ""
 }
+
+# Fields that must be present after parsing. If a resume genuinely doesn't
+# contain one, we null it explicitly rather than let it silently stay as an
+# empty string (which the form filler would otherwise treat as "no value,
+# fall back to Ollama").
+REQUIRED_PROFILE_KEYS = [
+    "full_name", "email", "phone", "linkedin", "github", "portfolio",
+    "location", "years_experience", "skills", "education", "work_experience"
+]
+
+def apply_null_defaults_and_warn(profile: dict):
+    """
+    Ensures required keys have an explicit value or None (never a silent
+    empty string/list), logging a warning for anything genuinely missing.
+    """
+    for key in REQUIRED_PROFILE_KEYS:
+        value = profile.get(key)
+        is_empty = value is None or value == "" or value == []
+        if is_empty:
+            profile[key] = None
+            logger.warning(f"Profile field '{key}' was not found in the resume. Leaving as null.")
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """Extracts raw text from a PDF file."""
@@ -72,10 +94,10 @@ def parse_resume_to_json(resume_text: str) -> dict:
       "full_name": "",
       "email": "",
       "phone": "",
-      "location": "",
-      "linkedin": "",
-      "github": "",
-      "portfolio": "",
+      "location": "City, Country (or City, State) if mentioned in the resume",
+      "linkedin": "Full LinkedIn profile URL if present",
+      "github": "Full GitHub profile URL if present",
+      "portfolio": "Personal website/portfolio URL if present",
       "current_title": "",
       "years_experience": "",
       "skills": ["skill1", "skill2"],
@@ -96,7 +118,7 @@ def parse_resume_to_json(resume_text: str) -> dict:
     Output strictly in JSON format matching the schema:
     """
     
-    response = query_ollama(prompt, system_prompt=system_prompt)
+    response = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
     
     # Strip markdown block formatting if model includes it
     cleaned_response = response.strip()
@@ -170,15 +192,19 @@ def get_or_create_profile() -> dict:
             resume_text = extract_text_from_docx(resume_path)
             
         parsed_profile = parse_resume_to_json(resume_text)
-        
+
         # Merge with default template
         profile = PROFILE_TEMPLATE.copy()
         profile.update(parsed_profile)
         profile["resume_file_path"] = os.path.relpath(resume_path, config.PROJECT_ROOT)
-        
+        profile["resume_text"] = resume_text.strip()
+
         # Split names
         populate_name_fields(profile)
-        
+
+        # Never let a genuinely missing field silently fall back to Ollama later
+        apply_null_defaults_and_warn(profile)
+
         # Write cache
         with open(config.PROFILE_JSON_PATH, "w", encoding="utf-8") as f:
             json.dump(profile, f, indent=4)

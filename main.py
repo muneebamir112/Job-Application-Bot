@@ -7,9 +7,9 @@ import config
 from modules.logger import logger, log_run_summary, get_job_logger
 from modules.resume_parser import get_or_create_profile
 from modules.sheet_sync import SheetSync
-from modules.form_filler import fill_and_submit_form
+from modules.form_filler import fill_and_submit_form, wait_for_fields_to_settle
 
-async def run_bot(retry_failed: bool, retry_human_attention: bool):
+async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool = False):
     logger.info("Initializing Job Application Automation Bot...")
 
     # Step 1: Check and load profile
@@ -43,7 +43,8 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool):
     # Step 3: Launch visible browser via browser-use
     browser_config = BrowserConfig(
         headless=config.HEADLESS,
-        disable_security=True
+        disable_security=True,
+        stealth=config.STEALTH_MODE
     )
     browser = Browser(config=browser_config)
     
@@ -83,11 +84,11 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool):
                     p_page = page._page
 
                 await p_page.goto(link, timeout=60000, wait_until="load")
-                await asyncio.sleep(3) # Wait for initial dynamic assets
+                await wait_for_fields_to_settle(p_page.main_frame) # Bounded wait for dynamic assets
 
                 # Fill and Submit form
-                status, reason = await fill_and_submit_form(page, profile, job_logger)
-                
+                status, reason = await fill_and_submit_form(page, profile, job_logger, dry_run=dry_run)
+
                 # Log outcome
                 if status == "Submitted":
                     submitted_count += 1
@@ -95,20 +96,24 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool):
                 elif status == "Human Attention":
                     human_attention_count += 1
                     job_logger.warning(f"Requires Human Attention: {reason}")
+                elif status == "Dry Run":
+                    job_logger.info(f"Dry run complete: {reason}")
                 else:
                     failed_count += 1
                     job_logger.error(f"Application failed: {reason}")
 
-                # Update live Sheet
-                sheet.update_status(row_idx, status)
-                
+                # Update live Sheet (dry runs are a local preview only - never touch the sheet)
+                if not dry_run:
+                    sheet.update_status(row_idx, status)
+
             except Exception as e:
                 failed_count += 1
                 import traceback
                 tb = traceback.format_exc()
                 job_logger.error(f"Unexpected exception during processing: {e}\n{tb}")
                 logger.error(f"Job {row_idx} failed with unexpected exception: {e}")
-                sheet.update_status(row_idx, "Failed")
+                if not dry_run:
+                    sheet.update_status(row_idx, "Failed")
 
             logger.info(f"Finished job {row_idx} processing. Log saved to {log_path}")
 
@@ -123,11 +128,13 @@ def main():
     parser = argparse.ArgumentParser(description="Job Application Automation Bot")
     parser.add_argument("--retry-failed", action="store_true", help="Retry applications with 'Failed' status")
     parser.add_argument("--retry-human-attention", action="store_true", help="Retry applications with 'Human Attention' status")
+    parser.add_argument("--dry-run", action="store_true", help="Fill out forms but stop before the final submit click; never updates the sheet")
     args = parser.parse_args()
 
     asyncio.run(run_bot(
         retry_failed=args.retry_failed,
-        retry_human_attention=args.retry_human_attention
+        retry_human_attention=args.retry_human_attention,
+        dry_run=args.dry_run
     ))
 
 if __name__ == "__main__":

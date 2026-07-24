@@ -6,6 +6,7 @@ An automated job application filler that parses your resume into a structured pr
 - **Resume Parsing**: Automatically converts a `.pdf` or `.docx` resume inside the `resume/` directory into a structured JSON profile (`profile.json`) using Ollama.
 - **Google Sheets Sync**: Fetches target rows from Google Sheets, updates them in real time, and adds timestamps.
 - **CAPTCHA & Auth Wall Protection**: Detects captchas, registration walls, and login boxes, safely flagging them as `Human Attention` without proceeding.
+- **Stealth Browsing**: Routes the browser through `patchright` + real Chrome (`STEALTH_MODE` in `.env`) instead of plain Playwright/Chromium, to avoid the automation fingerprints that trigger CAPTCHA/anti-bot challenges on some job sites in the first place.
 - **AI-Powered Form Filling**: Dynamically answers open-ended and multiple-choice questions matching your profile context.
 
 ---
@@ -68,4 +69,8 @@ Fill out the variables inside `.env`:
    - To retry applications marked as `Human Attention`, run:
      ```bash
      python main.py --retry-human-attention
+     ```
+   - To preview a form fill without actually submitting or touching the sheet (useful when trying a new site for the first time), run:
+     ```bash
+     python main.py --dry-run
      ```

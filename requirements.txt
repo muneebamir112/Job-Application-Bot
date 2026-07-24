@@ -1,5 +1,6 @@
-browser-use
-playwright
+browser-use==0.4.5
+playwright==1.52.0
+patchright
 gspread
 google-auth
 google-auth-oauthlib

@@ -17,11 +17,32 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
         p_page = page._page
 
     # --- 1. CAPTCHA iframe detection ---
+    # Invisible/badge-mode reCAPTCHA (size=invisible) runs silently in the
+    # background on a huge share of legitimate application forms and never
+    # blocks a real user - only an escalated challenge frame (the image-grid
+    # "bframe", or a visibly rendered checkbox widget) actually needs a human.
     try:
         frames = p_page.frames
         for frame in frames:
             url = frame.url.lower()
-            if any(term in url for term in ["recaptcha", "hcaptcha", "cloudflare", "challenges.cloudflare.com"]):
+
+            if "recaptcha" in url or "hcaptcha" in url:
+                if "bframe" in url or "/challenge" in url:
+                    # Escalated challenge frame - always blocking regardless of anchor mode
+                    return True, f"CAPTCHA challenge iframe detected: {url}"
+                if "size=invisible" in url:
+                    # Runs silently, doesn't present anything to the user - not blocking
+                    continue
+                # Visible-mode checkbox widget - only blocking if actually rendered visibly
+                try:
+                    frame_elem = await frame.frame_element()
+                    if frame_elem and await frame_elem.is_visible():
+                        return True, f"CAPTCHA iframe detected: {url}"
+                    continue
+                except Exception:
+                    return True, f"CAPTCHA iframe detected: {url}"
+
+            if "cloudflare" in url or "challenges.cloudflare.com" in url:
                 return True, f"CAPTCHA iframe detected: {url}"
     except Exception as e:
         logger.debug(f"Error checking frames: {e}")
