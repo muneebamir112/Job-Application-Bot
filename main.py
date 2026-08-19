@@ -2,6 +2,18 @@ import asyncio
 import argparse
 import sys
 import os
+
+# Windows console (cp1252) can't encode the emoji browser-use's internal
+# loggers emit; without this, every such log line raises UnicodeEncodeError
+# and spams "--- Logging error ---" blocks. Replace unencodable characters
+# instead of crashing the handler.
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
+import modules.browser_use_patch  # noqa: F401 - must run before Browser/BrowserConfig are used
 from browser_use import Browser, BrowserConfig
 import config
 from modules.logger import logger, log_run_summary, get_job_logger
@@ -66,6 +78,34 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
             job_logger.info(f"Starting application: {title} at {company}")
             job_logger.info(f"URL: {link}")
 
+            # Upload the resume tailored to this company (from the resume
+            # bot's CVS_DIR/<Company>/Jimmy Tran.pdf) instead of the single
+            # generic one profile["resume_file_path"] currently points to -
+            # only the uploaded file changes per job, not the rest of the
+            # profile (name/skills/work history used to answer form
+            # questions stay the same regardless of which job this is).
+            company_resume_path = os.path.join(config.CVS_DIR, company, "Jimmy Tran.pdf")
+            if not os.path.exists(company_resume_path):
+                # "Human Attention" is reserved for CAPTCHA detection during an
+                # actual application attempt - a missing resume isn't that, so
+                # leave the sheet status untouched (blank/Pending) rather than
+                # writing anything. That way this row is automatically picked
+                # up again by get_pending_jobs() on the next run once resume-bot
+                # has generated the resume, with no manual retry flag needed.
+                job_logger.warning(
+                    f"No tailored resume found for '{company}' at {company_resume_path} "
+                    f"(run Generate Resumes first) - skipping until one exists."
+                )
+                logger.warning(f"Job {row_idx} skipped: no tailored resume for '{company}'.")
+                logger.info(f"Finished job {row_idx} processing. Log saved to {log_path}")
+                continue
+            profile["resume_file_path"] = company_resume_path
+            # Lets ask_ollama_open_ended (cover letters, "why this role" etc.)
+            # fill in the real job title/company instead of leaving generic
+            # [Position Title]/[Company Name] placeholders in its answer.
+            profile["job_title"] = title
+            profile["company_name"] = company
+
             try:
                 # Get or create page
                 page = await context.get_current_page()
@@ -87,7 +127,7 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                 await wait_for_fields_to_settle(p_page.main_frame) # Bounded wait for dynamic assets
 
                 # Fill and Submit form
-                status, reason = await fill_and_submit_form(page, profile, job_logger, dry_run=dry_run)
+                status, reason = await fill_and_submit_form(page, profile, job_logger, company, dry_run=dry_run)
 
                 # Log outcome
                 if status == "Submitted":

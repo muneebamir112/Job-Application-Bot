@@ -6,6 +6,7 @@ google-auth
 google-auth-oauthlib
 pdfplumber
 python-docx
+reportlab
 requests
 pandas
 python-dotenv

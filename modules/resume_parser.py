@@ -139,6 +139,51 @@ def parse_resume_to_json(resume_text: str) -> dict:
         # Return empty template as fallback
         return {}
 
+def load_extra_info() -> dict:
+    """
+    Loads supplementary fields (LinkedIn, GitHub, work authorization, etc.)
+    that the resume text itself doesn't contain. Lives at
+    config.EXTRA_INFO_JSON_PATH, next to the resume file. Creates a blank
+    template on first run so the user has something to fill in.
+    """
+    if not os.path.exists(config.EXTRA_INFO_JSON_PATH):
+        template = {
+            "linkedin": "",
+            "github": "",
+            "portfolio": "",
+            "work_authorization": "",
+            "visa_sponsorship_needed": "",
+            "salary_expectation": "",
+            "notice_period": "",
+            "willing_to_relocate": ""
+        }
+        os.makedirs(os.path.dirname(config.EXTRA_INFO_JSON_PATH), exist_ok=True)
+        with open(config.EXTRA_INFO_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(template, f, indent=4)
+        logger.info(f"Created blank extra_info.json template at {config.EXTRA_INFO_JSON_PATH}")
+        return {}
+
+    with open(config.EXTRA_INFO_JSON_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def merge_extra_info(profile: dict) -> dict:
+    """
+    Fills in any field left null/empty by resume parsing with the matching
+    value from extra_info.json. Resume-parsed data always wins when present;
+    extra_info.json only fills the gaps. Unrecognized keys in extra_info.json
+    (e.g. custom answers not in PROFILE_TEMPLATE) are added as-is.
+    """
+    extra_info = load_extra_info()
+    for key, value in extra_info.items():
+        if value in (None, "", []):
+            continue
+        existing = profile.get(key)
+        if existing in (None, "", []):
+            profile[key] = value
+    return profile
+
+
 def populate_name_fields(profile: dict):
     """Automatically splits full_name into first_name and last_name if missing."""
     full_name = profile.get("full_name", "").strip()
@@ -163,7 +208,7 @@ def get_or_create_profile() -> dict:
         if os.path.exists(config.PROFILE_JSON_PATH):
             logger.info("No resume file found, but using existing profile.json.")
             with open(config.PROFILE_JSON_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                return merge_extra_info(json.load(f))
         else:
             # Create a blank profile template for the user to fill
             logger.warning(f"No resume file (.pdf/.docx) found in '{config.RESUME_DIR}'. Creating blank profile.json template.")
@@ -171,7 +216,7 @@ def get_or_create_profile() -> dict:
             blank_profile["resume_file_path"] = ""
             with open(config.PROFILE_JSON_PATH, "w", encoding="utf-8") as f:
                 json.dump(blank_profile, f, indent=4)
-            return blank_profile
+            return merge_extra_info(blank_profile)
 
     # Determine if parsing is needed
     reparse = False
@@ -209,14 +254,14 @@ def get_or_create_profile() -> dict:
         with open(config.PROFILE_JSON_PATH, "w", encoding="utf-8") as f:
             json.dump(profile, f, indent=4)
         logger.info(f"Successfully cached structured resume profile to {config.PROFILE_JSON_PATH}")
-        return profile
+        return merge_extra_info(profile)
     else:
         logger.info("Using cached profile.json")
         with open(config.PROFILE_JSON_PATH, "r", encoding="utf-8") as f:
             profile = json.load(f)
             # Ensure path is correct
             profile["resume_file_path"] = os.path.relpath(resume_path, config.PROJECT_ROOT)
-            return profile
+            return merge_extra_info(profile)
 
 if __name__ == "__main__":
     # Test execution

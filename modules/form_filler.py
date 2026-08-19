@@ -3,11 +3,14 @@ import re
 import json
 import difflib
 import asyncio
+from datetime import datetime
 from playwright.async_api import Page, ElementHandle
 import config
 from modules.logger import logger
 from modules.ollama_client import query_ollama
 from modules.captcha_detector import detect_captcha_or_login_wall
+from modules.text_utils import strip_markdown_formatting
+from modules.cover_letter import get_or_create_cover_letter
 
 # ---------------------------------------------------------------------------
 # Field classification
@@ -304,6 +307,37 @@ def best_matching_option(value: str, options_texts: list[str]) -> tuple[str | No
     return best_text, best_score
 
 
+VISA_SPONSORSHIP_LABEL_KEYWORDS = ("visa", "sponsorship", "sponsor")
+WORK_AUTHORIZATION_STATEMENT_KEYWORDS = ("authorized to work", "legally authorized")
+
+
+def resolve_visa_sponsorship_choice(label_norm: str, options_texts: list[str], profile: dict) -> str | None:
+    """
+    Visa/sponsorship questions are sometimes rendered as full statement
+    options ("I am legally authorized to work in the USA." / "I require
+    assistance immediately." / "I require assistance in the future.")
+    instead of a plain Yes/No toggle. Fuzzy-matching a short profile value
+    like "No" against those long, dissimilar sentences is unreliable (no
+    shared words to anchor on), so whenever the candidate doesn't need
+    sponsorship, always prefer whichever option explicitly states legal work
+    authorization over the generic similarity matcher. Returns None to fall
+    through to the generic matcher for genuine Yes/No-style options (where
+    the normal matcher already works fine) or when sponsorship IS needed.
+    """
+    if not any(kw in label_norm for kw in VISA_SPONSORSHIP_LABEL_KEYWORDS):
+        return None
+
+    needs_sponsorship = interpret_yes_no(profile.get("visa_sponsorship_needed"))
+    if needs_sponsorship is not False:
+        return None
+
+    for opt_text in options_texts:
+        opt_norm = normalize_text(opt_text)
+        if any(kw in opt_norm for kw in WORK_AUTHORIZATION_STATEMENT_KEYWORDS):
+            return opt_text
+    return None
+
+
 def log_field_decision(job_logger, label: str, classification: str, source: str, value) -> None:
     """Structured per-field log line: label -> classification -> source -> final value."""
     display_value = value
@@ -318,33 +352,28 @@ def json_context_string(profile: dict) -> str:
     return json.dumps(filtered_profile, indent=2)
 
 
-def strip_markdown_formatting(text: str) -> str:
-    """Safety net in case Ollama ignores the plain-prose instruction: strips common markdown syntax."""
-    if not text:
-        return text
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)  # **bold**
-    text = re.sub(r"__(.+?)__", r"\1", text)  # __bold__
-    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)  # *italic*
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)  # # Headers
-    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)  # - bullet points
-    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)  # 1. numbered lists
-    return text.strip()
-
-
 async def ask_ollama_open_ended(label: str, profile: dict, job_logger, classification: str) -> str:
     """The only call site allowed to generate a free-text Ollama answer for a form field."""
     assert classification == "OPEN_ENDED", "Ollama may only produce free text for OPEN_ENDED fields"
 
     profile_context = json_context_string(profile)
     resume_text = (profile.get("resume_text") or "")[:4000]
+    job_title = profile.get("job_title") or "the role"
+    company_name = profile.get("company_name") or "the company"
     system_prompt = (
         "You are the candidate answering a job application question in first person. "
         "Use ONLY facts from the candidate profile and resume text provided. "
         "Be specific and concise (2-4 sentences). Do not invent facts that aren't present in the context. "
         "This answer is typed directly into a plain-text form field, so write in plain prose only: "
-        "no markdown, no **bold**, no headers, no bullet points or numbered lists, no asterisks."
+        "no markdown, no **bold**, no headers, no bullet points or numbered lists, no asterisks. "
+        f"You are applying for the '{job_title}' position at '{company_name}'. If the question or answer "
+        "references the job title or company, use those exact names. Never output placeholder text such as "
+        "[Position Title], [Company Name], [Your Name], or similar brackets - always use the real values given."
     )
     prompt = f"""
+Job title you are applying for: {job_title}
+Company you are applying to: {company_name}
+
 Candidate profile context:
 {profile_context}
 
@@ -355,6 +384,8 @@ Question:
 {label}
 
 Answer the question professionally, concisely, and specifically, using only the facts above.
+If you reference the role or company, use the exact job title and company name given above -
+never leave placeholder brackets like [Position Title] or [Company Name] in the answer.
 Write plain prose only - no markdown formatting of any kind:
 """
     job_logger.info(f"Open-ended field detected: '{label}'. Querying Ollama...")
@@ -555,7 +586,11 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
         option_texts, option_selector = await find_visible_listbox_options(frame)
 
         if option_texts:
-            if value:
+            forced_choice = resolve_visa_sponsorship_choice(normalize_text(label), option_texts, profile)
+            if forced_choice:
+                best_text, score = forced_choice, 1.0
+                source = "profile.json (visa sponsorship not needed -> legally authorized statement)"
+            elif value:
                 best_text, score = best_matching_option(value, option_texts)
                 source = "dropdown match"
             else:
@@ -782,7 +817,11 @@ async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_
 
         selected_option_text = None
         source = None
-        if profile_value:
+        forced_choice = resolve_visa_sponsorship_choice(normalize_text(label), options_texts, profile)
+        if forced_choice:
+            selected_option_text = forced_choice
+            source = "profile.json (visa sponsorship not needed -> legally authorized statement)"
+        elif profile_value:
             best_text, score = best_matching_option(profile_value, options_texts)
             if best_text and score >= MATCH_THRESHOLD:
                 selected_option_text = best_text
@@ -852,6 +891,14 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                         await elem.click()
                         return True, f"profile.json (location-based race category: {category})", opt_text
 
+    forced_choice = resolve_visa_sponsorship_choice(label_norm, options_texts, profile)
+    if forced_choice:
+        for elem, opt_text in options:
+            if opt_text == forced_choice:
+                await elem.scroll_into_view_if_needed()
+                await elem.click()
+                return True, "profile.json (visa sponsorship not needed -> legally authorized statement)", opt_text
+
     matched_key = find_profile_synonym_match(label)
     profile_value = get_profile_value(profile, matched_key)
 
@@ -893,6 +940,24 @@ async def fill_radio_group(frame, name_attr: str, label: str, profile: dict, job
                 r_label = await r.evaluate("el => el.parentElement.innerText")
             radio_options.append((r, r_label.strip()))
 
+        # Some ATS forms pre-check a default option (e.g. "I require assistance
+        # immediately." on a visa-sponsorship question) before the bot ever
+        # touches the field. That default must be overridden, not mistaken for
+        # an answer the bot already gave - so this forced-choice check runs
+        # before the generic "already checked, skip" logic below.
+        options_texts = [text for _, text in radio_options if text]
+        forced_choice = resolve_visa_sponsorship_choice(normalize_text(label), options_texts, profile)
+        if forced_choice:
+            for r, opt_text in radio_options:
+                if opt_text == forced_choice:
+                    if await r.is_checked():
+                        return True
+                    await r.scroll_into_view_if_needed()
+                    await r.click()
+                    log_field_decision(job_logger, label, "CHOICE_FIELD",
+                        "profile.json (visa sponsorship not needed -> legally authorized statement, overriding page default)", forced_choice)
+                    return True
+
         # Radios themselves are idempotent to re-click (clicking an already-
         # selected one is a no-op), but skip anyway to avoid non-deterministic
         # re-answering (a fresh Ollama call could pick a different option) on
@@ -921,6 +986,22 @@ async def fill_aria_radio_group(frame, group_elem: ElementHandle, label: str, pr
             if not r_label.strip():
                 r_label = (await r.inner_text()).strip()
             radio_options.append((r, r_label.strip()))
+
+        # Overrides a page's pre-checked default (e.g. "I require assistance
+        # immediately.") before the generic "already answered, skip" check
+        # below mistakes it for an answer the bot already gave.
+        options_texts = [text for _, text in radio_options if text]
+        forced_choice = resolve_visa_sponsorship_choice(normalize_text(label), options_texts, profile)
+        if forced_choice:
+            for r, opt_text in radio_options:
+                if opt_text == forced_choice:
+                    if (await r.get_attribute("aria-checked")) == "true":
+                        return True
+                    await r.scroll_into_view_if_needed()
+                    await r.click()
+                    log_field_decision(job_logger, label, "CHOICE_FIELD",
+                        "profile.json (visa sponsorship not needed -> legally authorized statement, overriding page default)", forced_choice)
+                    return True
 
         for r, _ in radio_options:
             if (await r.get_attribute("aria-checked")) == "true":
@@ -1125,7 +1206,17 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
     """
     try:
         label_lower = label.lower()
-        if any(term in label_lower for term in ["resume", "cv", "curriculum vitae", "cover letter"]):
+        if "cover letter" in label_lower:
+            try:
+                cover_letter_path = get_or_create_cover_letter(profile, job_logger)
+            except Exception as e:
+                job_logger.error(f"Failed to generate cover letter for field '{label}': {e}")
+                return False
+            absolute_path = os.path.abspath(cover_letter_path)
+            await elem.set_input_files(absolute_path)
+            job_logger.info(f"Uploaded generated cover letter '{absolute_path}' to field '{label}'")
+            return True
+        elif any(term in label_lower for term in ["resume", "cv", "curriculum vitae"]):
             resume_path = profile.get("resume_file_path", "")
             if resume_path and os.path.exists(resume_path):
                 absolute_path = os.path.abspath(resume_path)
@@ -1135,7 +1226,7 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
             else:
                 job_logger.error(f"Resume file path '{resume_path}' is invalid or file does not exist.")
         else:
-            job_logger.info(f"Skipped file upload field '{label}' (not a resume/CV upload)")
+            job_logger.info(f"Skipped file upload field '{label}' (not a resume/CV/cover letter upload)")
             return True
     except Exception as e:
         job_logger.error(f"Failed to upload file to field '{label}': {e}")
@@ -1220,41 +1311,63 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
     return (len(unique_reasons) > 0), unique_reasons[:10]
 
 
+async def _element_top_position(elem) -> float:
+    """Vertical on-page position used to fill top-to-bottom. Elements with no
+    bounding box (fully hidden dropzone inputs etc.) sort after everything
+    with a known position, but are still processed."""
+    try:
+        box = await elem.bounding_box()
+        if box:
+            return box["y"]
+    except Exception:
+        pass
+    return float("inf")
+
+
 async def process_form_fields(frame, profile: dict, job_logger) -> bool:
     """
-    Enumerates and fills out form fields in the current step, within a single
-    frame (the main page or an embedded iframe - both expose the same
-    query_selector_all/locator API in Playwright).
+    Enumerates every field type in the current step (within a single frame -
+    the main page or an embedded iframe, both expose the same
+    query_selector_all/locator API in Playwright), then fills them in a
+    single pass ordered by on-page vertical position - top to bottom - rather
+    than grouping by field type (which would fill every text input first,
+    then jump back to the top for selects, then again for checkboxes, etc).
+    Each field type still goes through the exact same handler function as
+    before; only the visitation order changes.
     """
-    # 1. Inputs (Text, Email, Tel, etc.) and contenteditable text-like fields
+    tasks = []  # (position, discovery_order, kind, elem, extra)
+    order_counter = 0
+
+    async def _add(elem, kind, extra=None):
+        nonlocal order_counter
+        order_counter += 1
+        tasks.append((await _element_top_position(elem), order_counter, kind, elem, extra))
+
+    # Inputs (Text, Email, Tel, etc.) and contenteditable text-like fields
     inputs = await frame.query_selector_all(
         "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio']):not([type='file'])"
     )
     for elem in inputs:
         if await elem.is_visible():
-            label = await get_field_label(frame, elem)
-            await fill_text_field(frame, elem, label, profile, job_logger)
+            await _add(elem, "text")
 
     textareas = await frame.query_selector_all("textarea")
     for elem in textareas:
         if await elem.is_visible():
-            label = await get_field_label(frame, elem)
-            await fill_text_field(frame, elem, label, profile, job_logger)
+            await _add(elem, "text")
 
     editable_divs = await frame.query_selector_all("[contenteditable='true']")
     for elem in editable_divs:
         if await elem.is_visible():
-            label = await get_field_label(frame, elem)
-            await fill_text_field(frame, elem, label, profile, job_logger)
+            await _add(elem, "text")
 
-    # 2. Native selects
+    # Native selects
     selects = await frame.query_selector_all("select")
     for elem in selects:
         if await elem.is_visible():
-            label = await get_field_label(frame, elem)
-            await fill_select_field(elem, label, profile, job_logger)
+            await _add(elem, "select")
 
-    # 3. Custom-widget comboboxes not already covered by the input loop above
+    # Custom-widget comboboxes not already covered by the input loop above
     combobox_widgets = await frame.query_selector_all("[role='combobox']")
     for elem in combobox_widgets:
         try:
@@ -1264,24 +1377,14 @@ async def process_form_fields(frame, profile: dict, job_logger) -> bool:
         if tag in ("input", "textarea", "select"):
             continue
         if await elem.is_visible():
-            label = await get_field_label(frame, elem)
-            _, matched_key = classify_field(label, "combobox", profile)
-            await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key)
+            await _add(elem, "combobox")
 
-    # 4. File uploads (visibility not required - drag/drop dropzones hide the real input)
+    # File uploads (visibility not required - drag/drop dropzones hide the real input)
     files = await frame.query_selector_all("input[type='file']")
     for elem in files:
-        label = await get_field_label(frame, elem)
-        await handle_file_upload(elem, label, profile, job_logger)
+        await _add(elem, "file")
 
-    if files:
-        # Some ATS forms (e.g. Ashby's "Autofill from resume") re-parse the
-        # upload and re-render parts of the form afterward - give that a
-        # moment to settle before touching anything else, so we don't grab
-        # element handles that are about to be replaced.
-        await wait_for_fields_to_settle(frame, timeout_ms=2000)
-
-    # 5. Native radio buttons (grouped by name attribute to avoid duplicate Ollama calls)
+    # Native radio buttons (grouped by name attribute to avoid duplicate Ollama calls)
     radios = await frame.query_selector_all("input[type='radio']")
     processed_radio_names = set()
     for elem in radios:
@@ -1289,24 +1392,21 @@ async def process_form_fields(frame, profile: dict, job_logger) -> bool:
             name_attr = await elem.get_attribute("name")
             if name_attr and name_attr not in processed_radio_names:
                 processed_radio_names.add(name_attr)
-                label = await get_field_label(frame, elem)
-                await fill_radio_group(frame, name_attr, label, profile, job_logger)
+                await _add(elem, "radio", name_attr)
 
-    # 6. ARIA custom-widget radio groups
+    # ARIA custom-widget radio groups
     radiogroups = await frame.query_selector_all("[role='radiogroup']")
     for group in radiogroups:
         if await group.is_visible():
-            group_label = (await group.get_attribute("aria-label")) or await get_field_label(frame, group)
-            await fill_aria_radio_group(frame, group, group_label, profile, job_logger)
+            await _add(group, "radiogroup")
 
-    # 7. Native checkboxes
+    # Native checkboxes
     checkboxes = await frame.query_selector_all("input[type='checkbox']")
     for elem in checkboxes:
         if await elem.is_visible():
-            label = await get_field_label(frame, elem)
-            await fill_checkbox(elem, label, profile, job_logger)
+            await _add(elem, "checkbox")
 
-    # 8. ARIA custom-widget checkboxes
+    # ARIA custom-widget checkboxes
     aria_checkboxes = await frame.query_selector_all("[role='checkbox']")
     for elem in aria_checkboxes:
         try:
@@ -1316,18 +1416,63 @@ async def process_form_fields(frame, profile: dict, job_logger) -> bool:
         if tag == "input":
             continue
         if await elem.is_visible():
-            label = await get_field_label(frame, elem)
-            await fill_aria_checkbox(elem, label, profile, job_logger)
+            await _add(elem, "aria_checkbox")
 
-    # 9. Yes/No button-pair boolean questions (e.g. work-authorization, residency
+    # Yes/No button-pair boolean questions (e.g. work-authorization, residency
     # checks rendered as two styled <button>Yes</button>/<button>No</button>
     # elements instead of a native input - common beyond just one ATS)
     yesno_groups = await find_yesno_button_groups(frame, job_logger)
     job_logger.info(f"Detected {len(yesno_groups)} Yes/No button-pair field(s) on this step.")
     for container in yesno_groups:
         if await container.is_visible():
-            label = await get_field_label(frame, container)
-            await fill_yesno_buttons(frame, container, label, profile, job_logger)
+            await _add(container, "yesno")
+
+    # Single top-to-bottom pass, ordered by on-page position (ties broken by
+    # original discovery order so same-row fields stay in a stable order).
+    tasks.sort(key=lambda t: (t[0], t[1]))
+
+    for _, _, kind, elem, extra in tasks:
+        try:
+            if kind == "text":
+                label = await get_field_label(frame, elem)
+                await fill_text_field(frame, elem, label, profile, job_logger)
+            elif kind == "select":
+                label = await get_field_label(frame, elem)
+                await fill_select_field(elem, label, profile, job_logger)
+            elif kind == "combobox":
+                label = await get_field_label(frame, elem)
+                _, matched_key = classify_field(label, "combobox", profile)
+                await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key)
+            elif kind == "file":
+                label = await get_field_label(frame, elem)
+                await handle_file_upload(elem, label, profile, job_logger)
+                # Some ATS forms (e.g. Ashby's "Autofill from resume") re-parse the
+                # upload and re-render parts of the form afterward - give that a
+                # moment to settle before touching whatever comes next, so we
+                # don't act on element handles that are about to be replaced.
+                await wait_for_fields_to_settle(frame, timeout_ms=2000)
+            elif kind == "radio":
+                label = await get_field_label(frame, elem)
+                await fill_radio_group(frame, extra, label, profile, job_logger)
+            elif kind == "radiogroup":
+                group_label = (await elem.get_attribute("aria-label")) or await get_field_label(frame, elem)
+                await fill_aria_radio_group(frame, elem, group_label, profile, job_logger)
+            elif kind == "checkbox":
+                label = await get_field_label(frame, elem)
+                await fill_checkbox(elem, label, profile, job_logger)
+            elif kind == "aria_checkbox":
+                label = await get_field_label(frame, elem)
+                await fill_aria_checkbox(elem, label, profile, job_logger)
+            elif kind == "yesno":
+                label = await get_field_label(frame, elem)
+                await fill_yesno_buttons(frame, elem, label, profile, job_logger)
+        except Exception as e:
+            # A field earlier in this same pass (e.g. a file upload triggering
+            # an autofill re-render) can detach elements discovered before it.
+            # The outer validation-recovery loop in fill_and_submit_form
+            # re-scans the whole form afterward, so skip and move on rather
+            # than aborting the whole pass.
+            job_logger.warning(f"Skipping a '{kind}' field mid-pass due to an error (likely a stale element from a re-render earlier in this pass): {e}")
 
     return True
 
@@ -1376,7 +1521,22 @@ async def detect_submission_success(page, frame, pre_submit_url: str) -> bool:
     return False
 
 
-async def fill_and_submit_form(page: Page, profile: dict, job_logger, dry_run: bool = False) -> tuple[str, str]:
+async def _save_success_screenshot(page: Page, company: str, job_logger):
+    """Screenshot proof of a confirmed successful submission, saved to
+    SCREENSHOTS_DIR/<Company>/. Best-effort: a screenshot failure should
+    never turn an otherwise successful submission into a Failed one."""
+    try:
+        company_dir = os.path.join(config.SCREENSHOTS_DIR, company)
+        os.makedirs(company_dir, exist_ok=True)
+        screenshot_name = f"applied_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+        screenshot_path = os.path.join(company_dir, screenshot_name)
+        await page.screenshot(path=screenshot_path)
+        job_logger.info(f"Application submitted - screenshot saved to: {screenshot_path}")
+    except Exception as e:
+        job_logger.warning(f"Application submitted, but saving the screenshot failed: {e}")
+
+
+async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: str, dry_run: bool = False) -> tuple[str, str]:
     """
     Main orchestration loop for navigating and filling a single job application.
     Returns (status, reason). status is one of "Submitted", "Failed",
@@ -1426,18 +1586,12 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, dry_run: b
                 break
             await wait_for_fields_to_settle(p_page.main_frame)
 
-        # Step 3: Pre-submit validation and screenshot
+        # Step 3: Pre-submit validation
         has_captcha, captcha_reason = await detect_captcha_or_login_wall(page)
         if has_captcha:
             return "Human Attention", captcha_reason
 
         frame = await select_active_frame(p_page)
-
-        if config.SCREENSHOT_BEFORE_SUBMIT:
-            screenshot_name = f"presubmit_{int(asyncio.get_event_loop().time())}.png"
-            screenshot_path = os.path.join(config.LOGS_DIR, screenshot_name)
-            await page.screenshot(path=screenshot_path)
-            job_logger.info(f"Pre-submit screenshot saved to: {screenshot_path}")
 
         if dry_run:
             job_logger.info("Dry run enabled - form filled but stopping before the final submit click.")
@@ -1483,6 +1637,8 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, dry_run: b
 
             if await detect_submission_success(page, frame, pre_submit_url):
                 job_logger.info("Application form submitted successfully (confirmation detected).")
+                if config.SCREENSHOT_ON_SUCCESS:
+                    await _save_success_screenshot(page, company, job_logger)
                 return "Submitted", ""
             else:
                 job_logger.warning("Submit button was clicked but no confirmation (URL change or success message) was detected.")
