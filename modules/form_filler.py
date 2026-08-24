@@ -70,6 +70,7 @@ PROFILE_FIELD_SYNONYMS = {
     "willing_to_relocate": ["relocate", "relocation", "willing to relocate"],
     "skills": ["skills", "key skills", "technical skills", "list your skills"],
     "education": ["education", "highest degree", "degree", "qualification", "academic background"],
+    "referred_by": ["referred by", "who referred you", "referral name", "employee referral", "referrer", "referral"],
 }
 
 
@@ -1242,7 +1243,8 @@ async def find_and_click_next_button(frame) -> bool:
         "button:has-text('Next')", "button:has-text('Continue')",
         "button:has-text('Proceed')", "input[type='button'][value='Next']",
         "input[type='button'][value='Continue']", "a:has-text('Next')",
-        "button[id*='next']", "button[class*='next']"
+        "button[id*='next']", "button[class*='next']",
+        "button:has-text('Apply for this job')", "a:has-text('Apply for this job')"
     ]
     for selector in next_selectors:
         try:
@@ -1500,8 +1502,13 @@ async def detect_submission_success(page, frame, pre_submit_url: str) -> bool:
     p_page = _get_raw_playwright_page(page)
 
     try:
-        if p_page.url != pre_submit_url:
-            return True
+        from urllib.parse import urlparse
+        pre = urlparse(pre_submit_url)
+        post = urlparse(p_page.url)
+        if pre.netloc != post.netloc or pre.path != post.path:
+            post_path = post.path.rstrip('/')
+            if not (post_path.endswith('/application') or post_path.endswith('/apply')):
+                return True
     except Exception:
         pass
 
@@ -1521,22 +1528,22 @@ async def detect_submission_success(page, frame, pre_submit_url: str) -> bool:
     return False
 
 
-async def _save_success_screenshot(page: Page, company: str, job_logger):
-    """Screenshot proof of a confirmed successful submission, saved to
-    SCREENSHOTS_DIR/<Company>/. Best-effort: a screenshot failure should
-    never turn an otherwise successful submission into a Failed one."""
+async def _save_screenshot(page: Page, company: str, job_link: str, job_logger, prefix: str):
+    """Saves a full-page screenshot to SCREENSHOTS_DIR/<Company>/<job_link_slug>/<prefix>_<timestamp>.png"""
     try:
-        company_dir = os.path.join(config.SCREENSHOTS_DIR, company)
+        from modules.logger import clean_filename
+        link_slug = clean_filename(job_link) or "unknown_job"
+        company_dir = os.path.join(config.SCREENSHOTS_DIR, company, link_slug)
         os.makedirs(company_dir, exist_ok=True)
-        screenshot_name = f"applied_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
+        screenshot_name = f"{prefix}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
         screenshot_path = os.path.join(company_dir, screenshot_name)
-        await page.screenshot(path=screenshot_path)
-        job_logger.info(f"Application submitted - screenshot saved to: {screenshot_path}")
+        await page.screenshot(path=screenshot_path, full_page=True)
+        job_logger.info(f"Screenshot saved to: {screenshot_path}")
     except Exception as e:
-        job_logger.warning(f"Application submitted, but saving the screenshot failed: {e}")
+        job_logger.warning(f"Saving screenshot '{prefix}' failed: {e}")
 
 
-async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: str, dry_run: bool = False) -> tuple[str, str]:
+async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: str, job_link: str, dry_run: bool = False) -> tuple[str, str]:
     """
     Main orchestration loop for navigating and filling a single job application.
     Returns (status, reason). status is one of "Submitted", "Failed",
@@ -1617,6 +1624,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     btn = frame.locator(selector).first
                     if await btn.is_visible() and await btn.is_enabled():
                         await btn.scroll_into_view_if_needed()
+                        await _save_screenshot(p_page, company, job_link, job_logger, "before_submit")
                         await btn.click()
                         job_logger.info(f"Clicked submit button matching selector: '{selector}'")
                         submitted = True
@@ -1635,12 +1643,20 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                 pass
             await wait_for_fields_to_settle(p_page.main_frame, timeout_ms=5000)
 
+            await _save_screenshot(p_page, company, job_link, job_logger, "after_submit")
+
             if await detect_submission_success(page, frame, pre_submit_url):
                 job_logger.info("Application form submitted successfully (confirmation detected).")
                 if config.SCREENSHOT_ON_SUCCESS:
-                    await _save_success_screenshot(page, company, job_logger)
+                    await _save_screenshot(p_page, company, job_link, job_logger, "applied_success")
                 return "Submitted", ""
             else:
+                # Check if a CAPTCHA or login wall appeared as a result of clicking submit
+                has_captcha, captcha_reason = await detect_captcha_or_login_wall(page)
+                if has_captcha:
+                    job_logger.warning(f"Submission blocked: {captcha_reason}")
+                    return "Human Attention", f"Submission blocked by {captcha_reason}"
+                
                 job_logger.warning("Submit button was clicked but no confirmation (URL change or success message) was detected.")
                 return "Failed", "No confirmation of submission detected after clicking submit"
         else:

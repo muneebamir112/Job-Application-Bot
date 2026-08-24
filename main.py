@@ -127,7 +127,7 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                 await wait_for_fields_to_settle(p_page.main_frame) # Bounded wait for dynamic assets
 
                 # Fill and Submit form
-                status, reason = await fill_and_submit_form(page, profile, job_logger, company, dry_run=dry_run)
+                status, reason = await fill_and_submit_form(page, profile, job_logger, company, link, dry_run=dry_run)
 
                 # Log outcome
                 if status == "Submitted":
