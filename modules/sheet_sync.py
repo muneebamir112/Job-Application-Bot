@@ -54,10 +54,11 @@ class SheetSync:
             logger.error(f"Failed to load headers from worksheet: {e}")
             raise
 
-    def get_pending_jobs(self, retry_failed=False, retry_human_attention=False):
+    def get_pending_jobs(self, retry_failed=False, retry_human_attention=False, profiles_to_check=None):
         """
         Reads the sheet and returns a list of jobs that are pending processing.
-        Each job is a dict with details, and includes 'row_index' (1-based sheet row).
+        Each job is a dict with details, and includes 'row_index' (1-based sheet row)
+        and 'profiles_to_apply' which maps a profile name to its column index.
         """
         all_rows = self.sheet.get_all_values()
         if len(all_rows) <= 1:
@@ -86,14 +87,35 @@ class SheetSync:
             if not link:
                 continue
 
-            # Determine whether to process the job
-            should_process = False
-            if status in ("", "Pending"):
-                should_process = True
-            elif status == "Failed" and retry_failed:
-                should_process = True
-            elif status == "Human Attention" and retry_human_attention:
-                should_process = True
+            # Identify profiles to apply for
+            profiles_to_apply = {}
+            if profiles_to_check:
+                for profile_name in profiles_to_check:
+                    p_col = self.col_indices.get(profile_name.lower())
+                    if p_col and len(row) >= p_col:
+                        p_status = row[p_col - 1].strip()
+                        # Only apply if it's "Generated" or if it's "Failed" and retry_failed is true
+                        should_apply = False
+                        if p_status == "Generated":
+                            should_apply = True
+                        elif p_status == "Failed" and retry_failed:
+                            should_apply = True
+                        
+                        if should_apply:
+                            profiles_to_apply[profile_name] = p_col
+            
+            # Keep backwards compatibility for original processing logic if no profiles
+            if not profiles_to_check:
+                should_process = False
+                if status in ("", "Pending"):
+                    should_process = True
+                elif status == "Failed" and retry_failed:
+                    should_process = True
+                elif status == "Human Attention" and retry_human_attention:
+                    should_process = True
+            else:
+                # If checking specific profiles, only process if there's at least one profile to apply
+                should_process = len(profiles_to_apply) > 0
 
             if should_process:
                 # Add date added timestamp if empty
@@ -106,7 +128,8 @@ class SheetSync:
                     "company": company,
                     "title": title,
                     "link": link,
-                    "status": status
+                    "status": status,
+                    "profiles_to_apply": profiles_to_apply
                 })
 
         return pending_jobs
@@ -127,3 +150,11 @@ class SheetSync:
             logger.info(f"Updated Sheet row {row_index} status to: '{status}'")
         except Exception as e:
             logger.error(f"Failed to update sheet row {row_index} status: {e}")
+
+    def update_profile_status(self, row_index: int, col_index: int, status: str):
+        """Updates a specific profile's status column."""
+        try:
+            self.sheet.update_cell(row_index, col_index, status)
+            logger.info(f"Updated Sheet row {row_index}, col {col_index} profile status to: '{status}'")
+        except Exception as e:
+            logger.error(f"Failed to update sheet row {row_index} col {col_index} profile status: {e}")

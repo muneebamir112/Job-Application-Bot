@@ -18,15 +18,19 @@ def clean_filename(name: str) -> str:
     """Removes characters that are invalid in file names."""
     return "".join(c for c in name if c.isalnum() or c in (" ", "_", "-")).rstrip().replace(" ", "_")
 
-def get_job_logger(company: str, job_title: str):
+def get_job_logger(company: str, job_title: str, run_timestamp: str):
     """
     Creates and returns a file logger specifically for a single job application.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_company = clean_filename(company) or "unknown_company"
     safe_title = clean_filename(job_title) or "unknown_title"
+    
+    run_log_dir = os.path.join(config.LOGS_DIR, run_timestamp)
+    os.makedirs(run_log_dir, exist_ok=True)
+    
     log_filename = f"{safe_company}_{safe_title}_{timestamp}.log"
-    log_path = os.path.join(config.LOGS_DIR, log_filename)
+    log_path = os.path.join(run_log_dir, log_filename)
 
     job_logger = logging.getLogger(f"job_{timestamp}")
     job_logger.setLevel(logging.INFO)

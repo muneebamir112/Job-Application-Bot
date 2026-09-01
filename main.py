@@ -1,5 +1,6 @@
 import asyncio
 import argparse
+from datetime import datetime
 import sys
 import os
 
@@ -21,25 +22,68 @@ from modules.resume_parser import get_or_create_profile
 from modules.sheet_sync import SheetSync
 from modules.form_filler import fill_and_submit_form, wait_for_fields_to_settle
 
+async def dismiss_overlays(page, logger):
+    """Attempt to find and click common cookie consent / overlay dismiss buttons."""
+    selectors = [
+        "button:has-text('Accept All')",
+        "button:has-text('I Agree')",
+        "button:has-text('Allow Cookies')",
+        "button:has-text('Accept Cookies')",
+        "button:has-text('Got it')",
+        "button:has-text('Accept')",
+        "a:has-text('Accept')",
+        "a:has-text('I Agree')"
+    ]
+    
+    for selector in selectors:
+        try:
+            # Quick check if any matching element is visible
+            elements = await page.locator(selector).all()
+            for el in elements:
+                if await el.is_visible():
+                    logger.info(f"Dismissing overlay using selector: {selector}")
+                    await el.click(timeout=3000)
+                    import asyncio
+                    await asyncio.sleep(1) # wait a moment for animation to finish
+        except Exception:
+            pass # ignore errors if elements don't exist or become detached
+
 async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool = False):
     logger.info("Initializing Job Application Automation Bot...")
+    run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # Step 1: Check and load profile
-    try:
-        profile = get_or_create_profile()
-        if not profile.get("resume_file_path"):
-            logger.error("No resume found in resume/ directory. Please place resume.pdf or resume.docx there and re-run.")
-            sys.exit(1)
-    except Exception as e:
-        logger.error(f"Failed to initialize profile: {e}")
+    # Step 1: Discover and load profiles
+    profiles_dir = os.path.join(config.PROJECT_ROOT, "profiles")
+    all_profiles = {}
+    if not os.path.exists(profiles_dir):
+        logger.error(f"Profiles directory not found at {profiles_dir}. Please create it and add profile JSONs.")
         sys.exit(1)
+        
+    import glob
+    import json
+    for p_file in glob.glob(os.path.join(profiles_dir, "*.json")):
+        try:
+            with open(p_file, "r", encoding="utf-8") as f:
+                p_data = json.load(f)
+                if "name" in p_data or "full_name" in p_data:
+                    p_name = p_data.get("name") or p_data.get("full_name")
+                    all_profiles[p_name] = p_data
+        except Exception as e:
+            logger.error(f"Failed to load profile {p_file}: {e}")
+
+    if not all_profiles:
+        logger.error("No valid profiles found in profiles directory. Please add profile JSONs.")
+        sys.exit(1)
+    
+    logger.info(f"Loaded {len(all_profiles)} profiles: {list(all_profiles.keys())}")
 
     # Step 2: Initialize Google Sheet
     try:
         sheet = SheetSync()
         pending_jobs = sheet.get_pending_jobs(
             retry_failed=retry_failed,
-            retry_human_attention=retry_human_attention
+            retry_human_attention=retry_human_attention,
+            profiles_to_check=list(all_profiles.keys())
         )
     except Exception as e:
         logger.error(f"Failed to load Google Sheet: {e}")
@@ -73,44 +117,40 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
             title = job["title"]
             link = job["link"]
 
-            logger.info(f"Processing job {row_idx}: {title} at {company}...")
-            job_logger, log_path = get_job_logger(company, title)
-            job_logger.info(f"Starting application: {title} at {company}")
-            job_logger.info(f"URL: {link}")
-
-            # Upload the resume tailored to this company (from the resume
-            # bot's CVS_DIR/<Company>/Jimmy Tran.pdf) instead of the single
-            # generic one profile["resume_file_path"] currently points to -
-            # only the uploaded file changes per job, not the rest of the
-            # profile (name/skills/work history used to answer form
-            # questions stay the same regardless of which job this is).
-            company_resume_path = os.path.join(config.CVS_DIR, company, "Jimmy Tran.pdf")
-            if not os.path.exists(company_resume_path):
-                # "Human Attention" is reserved for CAPTCHA detection during an
-                # actual application attempt - a missing resume isn't that, so
-                # leave the sheet status untouched (blank/Pending) rather than
-                # writing anything. That way this row is automatically picked
-                # up again by get_pending_jobs() on the next run once resume-bot
-                # has generated the resume, with no manual retry flag needed.
-                job_logger.warning(
-                    f"No tailored resume found for '{company}' at {company_resume_path} "
-                    f"(run Generate Resumes first) - skipping until one exists."
-                )
-                logger.warning(f"Job {row_idx} skipped: no tailored resume for '{company}'.")
-                logger.info(f"Finished job {row_idx} processing. Log saved to {log_path}")
+            profiles_to_apply = job.get("profiles_to_apply", {})
+            if not profiles_to_apply:
                 continue
-            profile["resume_file_path"] = company_resume_path
-            # Lets ask_ollama_open_ended (cover letters, "why this role" etc.)
-            # fill in the real job title/company instead of leaving generic
-            # [Position Title]/[Company Name] placeholders in its answer.
-            profile["job_title"] = title
-            profile["company_name"] = company
 
-            try:
-                # Get or create page
-                page = await context.get_current_page()
-                if not page:
-                    page = await context.new_page()
+            for profile_name, col_idx in profiles_to_apply.items():
+                profile = all_profiles.get(profile_name)
+                if not profile:
+                    logger.warning(f"Profile {profile_name} found in sheet but missing JSON data, skipping.")
+                    continue
+
+                logger.info(f"Processing job {row_idx}: {title} at {company} (Profile: {profile_name})...")
+                job_logger, log_path = get_job_logger(company, title, run_timestamp)
+                job_logger.info(f"Starting application: {title} at {company} for {profile_name}")
+                job_logger.info(f"URL: {link}")
+
+                company_resume_path = os.path.join(config.CVS_DIR, company, f"{profile_name}.pdf")
+                if not os.path.exists(company_resume_path):
+                    job_logger.warning(
+                        f"No tailored resume found for '{company}' at {company_resume_path} "
+                        f"(run Generate Resumes first) - skipping until one exists."
+                    )
+                    logger.warning(f"Job {row_idx} skipped for {profile_name}: no tailored resume for '{company}'.")
+                    logger.info(f"Finished job {row_idx} processing for {profile_name}. Log saved to {log_path}")
+                    continue
+                
+                profile["resume_file_path"] = company_resume_path
+                profile["job_title"] = title
+                profile["company_name"] = company
+
+                try:
+                    # Get or create page
+                    page = await context.get_current_page()
+                    if not page:
+                        page = await context.new_page()
                 
                 # Navigate to the link
                 job_logger.info(f"Navigating to: {link}")
@@ -125,6 +165,9 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
 
                 await p_page.goto(link, timeout=60000, wait_until="load")
                 await wait_for_fields_to_settle(p_page.main_frame) # Bounded wait for dynamic assets
+
+                # Dismiss cookie banners and overlays before filling form
+                await dismiss_overlays(p_page, job_logger)
 
                 # Fill and Submit form
                 status, reason = await fill_and_submit_form(page, profile, job_logger, company, link, dry_run=dry_run)
@@ -142,20 +185,20 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                     failed_count += 1
                     job_logger.error(f"Application failed: {reason}")
 
-                # Update live Sheet (dry runs are a local preview only - never touch the sheet)
-                if not dry_run:
-                    sheet.update_status(row_idx, status)
+                    # Update live Sheet (dry runs are a local preview only - never touch the sheet)
+                    if not dry_run:
+                        sheet.update_profile_status(row_idx, col_idx, status)
 
-            except Exception as e:
-                failed_count += 1
-                import traceback
-                tb = traceback.format_exc()
-                job_logger.error(f"Unexpected exception during processing: {e}\n{tb}")
-                logger.error(f"Job {row_idx} failed with unexpected exception: {e}")
-                if not dry_run:
-                    sheet.update_status(row_idx, "Failed")
+                except Exception as e:
+                    failed_count += 1
+                    import traceback
+                    tb = traceback.format_exc()
+                    job_logger.error(f"Unexpected exception during processing: {e}\n{tb}")
+                    logger.error(f"Job {row_idx} failed for {profile_name} with unexpected exception: {e}")
+                    if not dry_run:
+                        sheet.update_profile_status(row_idx, col_idx, "Failed")
 
-            logger.info(f"Finished job {row_idx} processing. Log saved to {log_path}")
+                logger.info(f"Finished job {row_idx} processing for {profile_name}. Log saved to {log_path}")
 
     finally:
         # Close browser session cleanly

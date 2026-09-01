@@ -390,8 +390,11 @@ never leave placeholder brackets like [Position Title] or [Company Name] in the 
 Write plain prose only - no markdown formatting of any kind:
 """
     job_logger.info(f"Open-ended field detected: '{label}'. Querying Ollama...")
+    job_logger.info(f"--- OLLAMA PROMPT FOR '{label}' ---\nSystem: {system_prompt}\nUser: {prompt}\n----------------------------------")
     answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
-    return strip_markdown_formatting(answer)
+    clean_answer = strip_markdown_formatting(answer)
+    job_logger.info(f"--- OLLAMA RESPONSE FOR '{label}' ---\nRaw: {answer}\nCleaned: {clean_answer}\n------------------------------------")
+    return clean_answer
 
 
 async def ask_ollama_choice(label: str, options_texts: list[str], profile: dict, job_logger, classification: str) -> str:
@@ -413,7 +416,10 @@ Options:
 Choose the single best matching option. Your response MUST be exactly one of the options from the list above:
 """
     job_logger.info(f"No profile match for choice field '{label}'. Asking Ollama to pick among existing options...")
-    return query_ollama(prompt, system_prompt=system_prompt)
+    job_logger.info(f"--- OLLAMA PROMPT FOR '{label}' ---\nSystem: {system_prompt}\nUser: {prompt}\n----------------------------------")
+    answer = query_ollama(prompt, system_prompt=system_prompt)
+    job_logger.info(f"--- OLLAMA RESPONSE FOR '{label}' ---\n{answer}\n------------------------------------")
+    return answer
 
 
 # ---------------------------------------------------------------------------
@@ -627,13 +633,37 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
 # Field label detection
 # ---------------------------------------------------------------------------
 
-async def get_field_label(frame, element: ElementHandle) -> str:
+async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = False) -> str:
     """
     Attempts to retrieve a human-readable label/placeholder/name for a given field
-    element, checking label[for], aria-labelledby, aria-label, placeholder, name,
-    and finally nearby visible text, in that priority order.
+    element, prioritizing visible text over hidden attributes.
+    If is_group is True, it specifically looks for a group-level question (like a 
+    <legend> or an overarching question div) rather than the label of a single option.
     """
     try:
+        # 1. Group-specific logic (for radio groups, yes/no buttons)
+        if is_group:
+            group_label = await element.evaluate("""el => {
+                let fieldset = el.closest('fieldset');
+                if (fieldset) {
+                    let legend = fieldset.querySelector('legend');
+                    if (legend && legend.innerText.trim()) return legend.innerText.trim();
+                }
+                let node = el;
+                for (let depth = 0; depth < 5 && node; depth++) {
+                    if (node.previousElementSibling) {
+                        const text = node.previousElementSibling.innerText || node.previousElementSibling.textContent || '';
+                        // Usually questions are longer than 5 chars, filters out tiny UI artifacts
+                        if (text.trim() && text.trim().length > 5) return text.trim();
+                    }
+                    node = node.parentElement;
+                }
+                return '';
+            }""")
+            if group_label:
+                return group_label
+
+        # 2. Check explicit label associations
         elem_id = await element.get_attribute("id")
         if elem_id:
             label_elem = await frame.query_selector(f"label[for='{elem_id}']")
@@ -658,15 +688,9 @@ async def get_field_label(frame, element: ElementHandle) -> str:
             if label_text.strip():
                 return label_text.strip()
 
-        # Many component-based forms render the visible <label> as a sibling
-        # of the field (inside a shared wrapper) rather than an ancestor, and
-        # the label's `for` may target a wrapper id instead of the actual
-        # input's id - neither label[for] nor closest('label') catches this.
-        # Climb a few ancestor levels looking for a container that holds
-        # EXACTLY one <label> (an unambiguous match); stop climbing as soon as
-        # a container has more than one, since that means we've climbed past
-        # this field's own boundary into a shared section with other fields.
-        nearby_label_text = await element.evaluate("""el => {
+        # 4. Visible text heuristics (nearby <label> or previous text sibling)
+        nearby_visible_text = await element.evaluate("""el => {
+            // First look for a nearby <label> exactly 1 match
             let node = el;
             for (let depth = 0; depth < 4 && node; depth++) {
                 node = node.parentElement;
@@ -679,35 +703,56 @@ async def get_field_label(frame, element: ElementHandle) -> str:
                     break;
                 }
             }
+            
+            // Then look for previous sibling text
+            node = el;
+            for (let depth = 0; depth < 4 && node; depth++) {
+                if (node.previousElementSibling) {
+                    const text = node.previousElementSibling.innerText || node.previousElementSibling.textContent || '';
+                    if (text.trim()) return text.trim();
+                }
+                node = node.parentElement;
+            }
+            
+            // Finally, grab the first line of the parent container
+            let parent = el.parentElement;
+            if (parent) {
+                const lines = parent.innerText.split('\\n').map(l => l.trim()).filter(l => l);
+                if (lines.length > 0 && lines[0] !== (el.value || '')) {
+                    return lines[0];
+                }
+            }
             return '';
         }""")
-        if nearby_label_text and nearby_label_text.strip():
-            return nearby_label_text.strip()
+        
+        if nearby_visible_text and nearby_visible_text.strip():
+            return nearby_visible_text.strip()
 
+        # 5. Fallback to attributes
         placeholder = await element.get_attribute("placeholder")
         if placeholder and placeholder.strip():
             return placeholder.strip()
 
         aria_label = await element.get_attribute("aria-label")
-        if aria_label and aria_label.strip():
+        if aria_label and aria_label.strip() and len(aria_label.strip()) > 3:
             return aria_label.strip()
 
         name_attr = await element.get_attribute("name")
-        if name_attr and name_attr.strip():
+        if name_attr and name_attr.strip() and 2 < len(name_attr.strip()) < 50:
             return name_attr.strip()
-
-        nearby_text = await element.evaluate("el => { "
-            "let parent = el.parentElement; "
-            "if (!parent) return ''; "
-            "return parent.innerText.split('\\n')[0];"
-            "}")
-        if nearby_text and nearby_text.strip():
-            return nearby_text.strip()
 
     except Exception as e:
         logger.debug(f"Error getting field label: {e}")
 
     return ""
+
+
+async def get_field_label(frame, element: ElementHandle, is_group: bool = False) -> str:
+    """Wrapper to retrieve and safely truncate labels to prevent massive DOM text dumps."""
+    label = await _get_field_label_raw(frame, element, is_group)
+    if label and len(label) > 200:
+        return label[:197] + "..."
+    return label or ""
 
 
 async def is_combobox_element(element: ElementHandle) -> bool:
@@ -735,9 +780,21 @@ async def set_field_value(elem: ElementHandle, value: str) -> None:
     except Exception:
         pass
 
-    await elem.click()
-    await elem.press("Control+a")
-    await elem.press("Backspace")
+    try:
+        await elem.scroll_into_view_if_needed(timeout=2000)
+        await elem.click(timeout=3000)
+    except Exception:
+        try:
+            await elem.click(force=True, timeout=2000)
+        except Exception:
+            pass
+
+    try:
+        await elem.press("Control+a", timeout=1000)
+        await elem.press("Backspace", timeout=1000)
+    except Exception:
+        pass
+
     if is_editable:
         await elem.type(value, delay=20)
     else:
@@ -1207,6 +1264,20 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
     """
     try:
         label_lower = label.lower()
+        
+        # Fallback: if the visible label is generic (like "Drop or select"),
+        # check underlying DOM attributes for hints like "data-testid='resume'"
+        if not any(term in label_lower for term in ["resume", "cv", "curriculum", "cover letter"]):
+            dom_hints = await elem.evaluate("""el => {
+                let lbl = el.closest('label');
+                return [
+                    el.id, el.name, el.getAttribute('data-testid'), el.getAttribute('aria-label'),
+                    lbl ? lbl.getAttribute('data-testid') : '',
+                    lbl ? lbl.getAttribute('aria-label') : ''
+                ].join(' ').toLowerCase();
+            }""")
+            label_lower += " " + dom_hints
+
         if "cover letter" in label_lower:
             try:
                 cover_letter_path = get_or_create_cover_letter(profile, job_logger)
@@ -1234,7 +1305,7 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
     return False
 
 
-async def find_and_click_next_button(frame) -> bool:
+async def find_and_click_next_button(frame, fields_found: int = 1) -> bool:
     """
     Searches for multi-step buttons like 'Next', 'Continue', 'Proceed', 'Step'
     and clicks them if found. Returns True if button was clicked.
@@ -1244,8 +1315,12 @@ async def find_and_click_next_button(frame) -> bool:
         "button:has-text('Proceed')", "input[type='button'][value='Next']",
         "input[type='button'][value='Continue']", "a:has-text('Next')",
         "button[id*='next']", "button[class*='next']",
-        "button:has-text('Apply for this job')", "a:has-text('Apply for this job')"
+        "button:has-text('Apply for this job')", "a:has-text('Apply for this job')",
+        "a:has-text('Apply Now')", "button:has-text('Apply Now')",
+        "a:has-text('Apply To Position')", "button:has-text('Apply To Position')",
+        "a:has-text('Apply')", "button:has-text('Apply')"
     ]
+        
     for selector in next_selectors:
         try:
             btn = frame.locator(selector).first
@@ -1297,9 +1372,11 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
         error_elems = await frame.query_selector_all("[class*='error'], [class*='invalid']")
         for elem in error_elems:
             if await elem.is_visible():
-                text = (await elem.inner_text()).strip()
-                if text and len(text) < 200:
-                    reasons.append(f"Visible error message: '{text}'")
+                has_inputs = await elem.evaluate("el => el.querySelector('input, select, textarea, button, a, li, label, [role]') !== null")
+                if not has_inputs:
+                    text = (await elem.inner_text()).strip()
+                    if text and len(text) < 200 and "\n" not in text:
+                        reasons.append(f"Visible error message: '{text}'")
     except Exception:
         pass
 
@@ -1313,127 +1390,82 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
     return (len(unique_reasons) > 0), unique_reasons[:10]
 
 
-async def _element_top_position(elem) -> float:
-    """Vertical on-page position used to fill top-to-bottom. Elements with no
-    bounding box (fully hidden dropzone inputs etc.) sort after everything
-    with a known position, but are still processed."""
-    try:
-        box = await elem.bounding_box()
-        if box:
-            return box["y"]
-    except Exception:
-        pass
-    return float("inf")
 
 
-async def process_form_fields(frame, profile: dict, job_logger) -> bool:
+
+async def process_form_fields(frame, profile: dict, job_logger) -> int:
     """
-    Enumerates every field type in the current step (within a single frame -
-    the main page or an embedded iframe, both expose the same
-    query_selector_all/locator API in Playwright), then fills them in a
-    single pass ordered by on-page vertical position - top to bottom - rather
-    than grouping by field type (which would fill every text input first,
-    then jump back to the top for selects, then again for checkboxes, etc).
-    Each field type still goes through the exact same handler function as
-    before; only the visitation order changes.
+    Enumerates every field type in the current step and fills them in a single
+    pass ordered by on-page vertical position - top to bottom. Using a unified
+    selector guarantees that if bounding box detection fails, elements fall back
+    to their strict DOM order (which matches visual top-to-bottom layout), rather
+    than grouping by field type.
     """
-    tasks = []  # (position, discovery_order, kind, elem, extra)
+    tasks = []  # (discovery_order, kind, elem, extra)
     order_counter = 0
 
     async def _add(elem, kind, extra=None):
         nonlocal order_counter
         order_counter += 1
-        tasks.append((await _element_top_position(elem), order_counter, kind, elem, extra))
+        tasks.append((order_counter, kind, elem, extra))
 
-    # Inputs (Text, Email, Tel, etc.) and contenteditable text-like fields
-    inputs = await frame.query_selector_all(
-        "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='checkbox']):not([type='radio']):not([type='file'])"
+    giant_selector = (
+        "input:not([type='hidden']):not([type='submit']):not([type='button']), "
+        "input[type='file'], "
+        "textarea, [contenteditable='true'], select, [role='combobox'], "
+        "[role='radiogroup'], [role='checkbox']"
     )
-    for elem in inputs:
-        if await elem.is_visible():
-            await _add(elem, "text")
-
-    textareas = await frame.query_selector_all("textarea")
-    for elem in textareas:
-        if await elem.is_visible():
-            await _add(elem, "text")
-
-    editable_divs = await frame.query_selector_all("[contenteditable='true']")
-    for elem in editable_divs:
-        if await elem.is_visible():
-            await _add(elem, "text")
-
-    # Native selects
-    selects = await frame.query_selector_all("select")
-    for elem in selects:
-        if await elem.is_visible():
-            await _add(elem, "select")
-
-    # Custom-widget comboboxes not already covered by the input loop above
-    combobox_widgets = await frame.query_selector_all("[role='combobox']")
-    for elem in combobox_widgets:
-        try:
-            tag = await elem.evaluate("el => el.tagName.toLowerCase()")
-        except Exception:
-            continue
-        if tag in ("input", "textarea", "select"):
-            continue
-        if await elem.is_visible():
-            await _add(elem, "combobox")
-
-    # File uploads (visibility not required - drag/drop dropzones hide the real input)
-    files = await frame.query_selector_all("input[type='file']")
-    for elem in files:
-        await _add(elem, "file")
-
-    # Native radio buttons (grouped by name attribute to avoid duplicate Ollama calls)
-    radios = await frame.query_selector_all("input[type='radio']")
+    
+    elems = await frame.query_selector_all(giant_selector)
     processed_radio_names = set()
-    for elem in radios:
-        if await elem.is_visible():
-            name_attr = await elem.get_attribute("name")
-            if name_attr and name_attr not in processed_radio_names:
-                processed_radio_names.add(name_attr)
-                await _add(elem, "radio", name_attr)
 
-    # ARIA custom-widget radio groups
-    radiogroups = await frame.query_selector_all("[role='radiogroup']")
-    for group in radiogroups:
-        if await group.is_visible():
-            await _add(group, "radiogroup")
-
-    # Native checkboxes
-    checkboxes = await frame.query_selector_all("input[type='checkbox']")
-    for elem in checkboxes:
-        if await elem.is_visible():
-            await _add(elem, "checkbox")
-
-    # ARIA custom-widget checkboxes
-    aria_checkboxes = await frame.query_selector_all("[role='checkbox']")
-    for elem in aria_checkboxes:
+    for elem in elems:
         try:
             tag = await elem.evaluate("el => el.tagName.toLowerCase()")
         except Exception:
             continue
-        if tag == "input":
-            continue
-        if await elem.is_visible():
-            await _add(elem, "aria_checkbox")
+            
+        role = (await elem.get_attribute("role") or "").lower()
+        type_attr = (await elem.get_attribute("type") or "").lower()
+        contenteditable = (await elem.get_attribute("contenteditable") or "").lower()
 
-    # Yes/No button-pair boolean questions (e.g. work-authorization, residency
-    # checks rendered as two styled <button>Yes</button>/<button>No</button>
-    # elements instead of a native input - common beyond just one ATS)
+        if tag == "input" and type_attr == "radio":
+            if await elem.is_visible():
+                name_attr = await elem.get_attribute("name")
+                if name_attr and name_attr not in processed_radio_names:
+                    processed_radio_names.add(name_attr)
+                    await _add(elem, "radio", name_attr)
+        elif tag == "input" and type_attr == "checkbox":
+            if await elem.is_visible():
+                await _add(elem, "checkbox")
+        elif tag == "input" and type_attr == "file":
+            await _add(elem, "file")
+        elif role == "radiogroup":
+            if await elem.is_visible():
+                await _add(elem, "radiogroup")
+        elif role == "checkbox" and tag != "input":
+            if await elem.is_visible():
+                await _add(elem, "aria_checkbox")
+        elif role == "combobox" and tag not in ("input", "textarea", "select"):
+            if await elem.is_visible():
+                await _add(elem, "combobox")
+        elif tag == "select":
+            if await elem.is_visible():
+                await _add(elem, "select")
+        elif tag == "textarea" or contenteditable == "true" or (tag == "input" and type_attr not in ("radio", "checkbox", "file", "hidden", "submit", "button")):
+            if await elem.is_visible():
+                await _add(elem, "text")
+
     yesno_groups = await find_yesno_button_groups(frame, job_logger)
     job_logger.info(f"Detected {len(yesno_groups)} Yes/No button-pair field(s) on this step.")
     for container in yesno_groups:
         if await container.is_visible():
             await _add(container, "yesno")
 
-    # Single top-to-bottom pass, ordered by on-page position (ties broken by
-    # original discovery order so same-row fields stay in a stable order).
-    tasks.sort(key=lambda t: (t[0], t[1]))
+    # Single top-to-bottom pass, ordered strictly by DOM discovery order.
+    tasks.sort(key=lambda t: t[0])
 
-    for _, _, kind, elem, extra in tasks:
+    for _, kind, elem, extra in tasks:
         try:
             if kind == "text":
                 label = await get_field_label(frame, elem)
@@ -1454,10 +1486,10 @@ async def process_form_fields(frame, profile: dict, job_logger) -> bool:
                 # don't act on element handles that are about to be replaced.
                 await wait_for_fields_to_settle(frame, timeout_ms=2000)
             elif kind == "radio":
-                label = await get_field_label(frame, elem)
+                label = await get_field_label(frame, elem, is_group=True)
                 await fill_radio_group(frame, extra, label, profile, job_logger)
             elif kind == "radiogroup":
-                group_label = (await elem.get_attribute("aria-label")) or await get_field_label(frame, elem)
+                group_label = (await elem.get_attribute("aria-label")) or await get_field_label(frame, elem, is_group=True)
                 await fill_aria_radio_group(frame, elem, group_label, profile, job_logger)
             elif kind == "checkbox":
                 label = await get_field_label(frame, elem)
@@ -1466,7 +1498,7 @@ async def process_form_fields(frame, profile: dict, job_logger) -> bool:
                 label = await get_field_label(frame, elem)
                 await fill_aria_checkbox(elem, label, profile, job_logger)
             elif kind == "yesno":
-                label = await get_field_label(frame, elem)
+                label = await get_field_label(frame, elem, is_group=True)
                 await fill_yesno_buttons(frame, elem, label, profile, job_logger)
         except Exception as e:
             # A field earlier in this same pass (e.g. a file upload triggering
@@ -1476,7 +1508,7 @@ async def process_form_fields(frame, profile: dict, job_logger) -> bool:
             # than aborting the whole pass.
             job_logger.warning(f"Skipping a '{kind}' field mid-pass due to an error (likely a stale element from a re-render earlier in this pass): {e}")
 
-    return True
+    return len(tasks)
 
 
 # ---------------------------------------------------------------------------
@@ -1501,29 +1533,82 @@ async def detect_submission_success(page, frame, pre_submit_url: str) -> bool:
     """
     p_page = _get_raw_playwright_page(page)
 
+    # Helper: safe URL parse
     try:
         from urllib.parse import urlparse
         pre = urlparse(pre_submit_url)
-        post = urlparse(p_page.url)
-        if pre.netloc != post.netloc or pre.path != post.path:
-            post_path = post.path.rstrip('/')
-            if not (post_path.endswith('/application') or post_path.endswith('/apply')):
+    except Exception:
+        pre = None
+
+    # 1) Check for a newly opened page/tab that differs from the pre-submit URL
+    try:
+        ctx_pages = list(p_page.context.pages)
+        for pg in ctx_pages:
+            if pg is p_page:
+                continue
+            try:
+                if pre:
+                    post = urlparse(pg.url)
+                    if post.netloc != pre.netloc or post.path.rstrip('/') != pre.path.rstrip('/'):
+                        return True
+                title = (await pg.title()).lower()
+                for pattern in SUCCESS_TEXT_PATTERNS:
+                    if pattern in title:
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 2) Check main page URL change (unchanged logic, but more permissive)
+    try:
+        if pre:
+            post = urlparse(p_page.url)
+            if pre.netloc != post.netloc or pre.path.rstrip('/') != post.path.rstrip('/'):
+                post_path = post.path.rstrip('/')
+                if not (post_path.endswith('/application') or post_path.endswith('/apply')):
+                    return True
+    except Exception:
+        pass
+
+    # 3) Check page title for success phrases
+    try:
+        title = (await p_page.title()).lower()
+        for pattern in SUCCESS_TEXT_PATTERNS:
+            if pattern in title:
                 return True
     except Exception:
         pass
 
-    scopes = [p_page]
-    if frame is not p_page.main_frame:
-        scopes.append(frame)
+    # 4) Check the text content of the top-level page and all frames
+    try:
+        scopes = [p_page] + list(p_page.frames)
+        for scope in scopes:
+            try:
+                body_text = (await scope.inner_text("body")).lower()
+                for pattern in SUCCESS_TEXT_PATTERNS:
+                    if pattern in body_text:
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
 
-    for scope in scopes:
-        try:
-            body_text = (await scope.inner_text("body")).lower()
-            for pattern in SUCCESS_TEXT_PATTERNS:
-                if pattern in body_text:
-                    return True
-        except Exception:
-            continue
+    # 5) Check for common semantic success elements (alerts, status, thank-you classes)
+    success_selectors = ["[role='alert']", "[role='status']", ".application-confirmation", ".thank-you", ".submitted", "text=thank you", "text=application received"]
+    try:
+        for sel in success_selectors:
+            try:
+                loc = p_page.locator(sel)
+                cnt = await loc.count()
+                if cnt > 0:
+                    for i in range(cnt):
+                        if await loc.nth(i).is_visible():
+                            return True
+            except Exception:
+                continue
+    except Exception:
+        pass
 
     return False
 
@@ -1571,7 +1656,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             await wait_for_fields_to_settle(p_page.main_frame)
             frame = await select_active_frame(p_page)
 
-            await process_form_fields(frame, profile, job_logger)
+            fields_found = await process_form_fields(frame, profile, job_logger)
 
             # Validation-error recovery loop: re-attempt filling up to twice more
             for recovery_pass in range(1, MAX_VALIDATION_RECOVERY_PASSES + 1):
@@ -1579,14 +1664,14 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                 if not has_errors:
                     break
                 job_logger.warning(f"Validation issues detected (pass {recovery_pass}): {reasons}. Re-attempting fill...")
-                await process_form_fields(frame, profile, job_logger)
+                fields_found = await process_form_fields(frame, profile, job_logger)
 
             has_errors, reasons = await find_validation_problems(frame)
             if has_errors:
                 return "Failed", f"Unresolved validation errors after retries: {reasons}"
 
             # Check if there is a next step
-            clicked_next = await find_and_click_next_button(frame)
+            clicked_next = await find_and_click_next_button(frame, fields_found)
             if not clicked_next:
                 # No next button found, assume we are on the final step
                 job_logger.info("No next button found. Form filling complete.")
@@ -1606,17 +1691,25 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
 
         # Step 4: Submission
         if config.AUTO_SUBMIT:
+            try:
+                pre_submit_url = p_page.url
+            except Exception:
+                pre_submit_url = ""
+
+            # Check if we accidentally already submitted the form (e.g. if a "Next" or "Apply" button 
+            # clicked during the form loop was actually the final submit button).
+            if await detect_submission_success(page, frame, pre_submit_url):
+                job_logger.info("Application already submitted successfully during the navigation loop.")
+                if config.SCREENSHOT_ON_SUCCESS:
+                    await _save_screenshot(p_page, company, job_link, job_logger, "applied_success")
+                return "Submitted", ""
+
             submit_selectors = [
                 "button[type='submit']", "input[type='submit']",
                 "button:has-text('Submit')", "button:has-text('Submit Application')",
                 "button:has-text('Apply')", "input[type='button'][value='Submit']",
                 "input[type='button'][value='Apply']"
             ]
-
-            try:
-                pre_submit_url = p_page.url
-            except Exception:
-                pre_submit_url = ""
 
             submitted = False
             for selector in submit_selectors:
@@ -1631,8 +1724,118 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                         break
                 except Exception:
                     continue
+            # Fallback 1: Try role/button/anchor matches for 'Apply' or other text-based buttons
+            if not submitted:
+                extra_text_selectors = [
+                    "[role='button']:has-text('Apply')", "a:has-text('Apply')",
+                    "[role='button']:has-text('Submit')", "a:has-text('Submit')",
+                    "button:has-text('Apply')", "button:has-text('Submit')",
+                ]
+                try:
+                    frames_to_try = [frame] + [f for f in p_page.frames if f is not frame]
+                    for scope in frames_to_try:
+                        for sel in extra_text_selectors:
+                            try:
+                                loc = scope.locator(sel).first
+                                if await loc.count() and await loc.is_visible() and await loc.is_enabled():
+                                    await loc.scroll_into_view_if_needed()
+                                    await _save_screenshot(p_page, company, job_link, job_logger, "before_submit")
+                                    await loc.click()
+                                    job_logger.info(f"Clicked submit-like element matching selector: '{sel}'")
+                                    submitted = True
+                                    break
+                            except Exception:
+                                continue
+                        if submitted:
+                            break
+                except Exception:
+                    pass
+
+            # Fallback 2: Programmatically submit the <form> element if present
+            if not submitted:
+                try:
+                    frm = await frame.query_selector("form")
+                    if frm:
+                        try:
+                            await frm.evaluate("f => (f.requestSubmit ? f.requestSubmit() : f.submit())")
+                            job_logger.info("Submitted using form.requestSubmit()/form.submit()")
+                            submitted = True
+                        except Exception:
+                            # Some sites prevent direct submit; continue to diagnostics
+                            pass
+                except Exception:
+                    pass
 
             if not submitted:
+                # Fallback 3: run an in-page JS search that traverses shadowRoots and iframes
+                try:
+                    js_clicker = '''(function(){
+    function isVisible(el){
+        if(!el) return false;
+        var style = window.getComputedStyle(el);
+        if(!style) return false;
+        if(style.visibility==='hidden' || style.display==='none' || parseFloat(style.opacity||1)===0) return false;
+        var r = el.getBoundingClientRect();
+        return !!(r.width && r.height);
+    }
+    function findAndClick(root){
+        var list = [];
+        function visit(node){
+            if(node.nodeType!==1) return;
+            try{
+                var text = (node.innerText||'').trim().toLowerCase();
+                if(isVisible(node) && (text.indexOf('apply')!==-1 || text.indexOf('submit')!==-1)){
+                    list.push(node);
+                }
+            }catch(e){}
+            try{ if(node.shadowRoot) visit(node.shadowRoot.host); }catch(e){}
+            for(var i=0;i<node.children.length;i++) visit(node.children[i]);
+        }
+        visit(root.documentElement||root);
+        if(list.length){
+            for(var j=0;j<list.length;j++){
+                try{ list[j].click(); return true;}catch(e){}
+            }
+        }
+        return false;
+    }
+    try{ if(findAndClick(document)) return true;}catch(e){}
+    var iframes = document.querySelectorAll('iframe');
+    for(var k=0;k<iframes.length;k++){
+        try{
+            var doc = iframes[k].contentDocument;
+            if(doc && findAndClick(doc)) return true;
+        }catch(e){}
+    }
+    return false;
+})();'''
+
+                    clicked = await frame.evaluate(js_clicker)
+                    if clicked:
+                        job_logger.info("Clicked submit-like element via JS fallback")
+                        submitted = True
+                except Exception:
+                    pass
+
+            if not submitted:
+                # Save a diagnostic screenshot and the page HTML to help debugging
+                try:
+                    await _save_screenshot(p_page, company, job_link, job_logger, "no_submit")
+                except Exception:
+                    pass
+                try:
+                    content = await p_page.content()
+                    from modules.logger import clean_filename
+                    link_slug = clean_filename(job_link) or "unknown_job"
+                    company_dir = os.path.join(config.SCREENSHOTS_DIR, company, link_slug)
+                    os.makedirs(company_dir, exist_ok=True)
+                    html_path = os.path.join(company_dir, "no_submit_page.html")
+                    with open(html_path, "w", encoding="utf-8") as fh:
+                        fh.write(content)
+                    job_logger.info(f"Saved page HTML to: {html_path}")
+                except Exception as e:
+                    job_logger.warning(f"Saving page HTML failed: {e}")
+
                 return "Failed", "Could not locate visible submit button on the final page"
 
             # Wait for response/navigation - bounded settle-wait plus the existing
