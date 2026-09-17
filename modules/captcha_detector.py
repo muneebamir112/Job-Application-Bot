@@ -42,8 +42,20 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
                 except Exception:
                     return True, f"CAPTCHA iframe detected: {url}"
 
-            if "cloudflare" in url or "challenges.cloudflare.com" in url:
-                return True, f"CAPTCHA iframe detected: {url}"
+            if "cloudflare" in url or "challenges.cloudflare.com" in url or "turnstile" in url:
+                return True, f"Cloudflare Turnstile / challenge iframe detected: {url}"
+
+            if "arkoselabs" in url or "funcaptcha" in url:
+                return True, f"Arkose / FunCaptcha iframe detected: {url}"
+
+            if "datadome" in url or "captcha-delivery.com" in url:
+                return True, f"DataDome CAPTCHA iframe detected: {url}"
+
+            if "awswaf" in url or "token.awswaf.com" in url:
+                return True, f"AWS WAF CAPTCHA iframe detected: {url}"
+
+            if "geetest" in url:
+                return True, f"GeeTest CAPTCHA iframe detected: {url}"
     except Exception as e:
         logger.debug(f"Error checking frames: {e}")
 
@@ -52,13 +64,16 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
         "[class*='recaptcha']", "[id*='recaptcha']",
         "[class*='hcaptcha']", "[id*='hcaptcha']",
         "[class*='cf-challenge']", "[id*='cf-challenge']",
+        ".cf-turnstile", "[data-turnstile-sitekey]", "[name='cf-turnstile-response']",
         "[id*='captcha']", "[class*='captcha']",
         "iframe[src*='recaptcha']", "iframe[src*='hcaptcha']",
-        "iframe[src*='cloudflare']",
-        "[role='checkbox'][aria-label*='human']",
-        "[role='checkbox'][aria-label*='captcha']",
-        "[aria-label*='verify you are human']",
-        "[aria-label*='verify page']"
+        "iframe[src*='cloudflare']", "iframe[src*='turnstile']",
+        "iframe[src*='arkoselabs']", "[id*='fc-iframe-wrap']",
+        "[role='checkbox'][aria-label*='human' i]",
+        "[role='checkbox'][aria-label*='captcha' i]",
+        "[aria-label*='verify you are human' i]",
+        "[aria-label*='verify page' i]",
+        "#px-captcha", ".px-captcha", "[id*='datadome']"
     ]
     
     for selector in captcha_selectors:
@@ -81,7 +96,9 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
             "security check to continue",
             "we want to make sure you're a human",
             "bot verification",
-            "checking your browser"
+            "checking your browser",
+            "press & hold to confirm you are human",
+            "press and hold to confirm you are human"
         ]
         for pattern in captcha_text_patterns:
             if pattern in body_text_lower:
@@ -94,7 +111,9 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
         "input[type='password']",
         "form[action*='login']",
         "form[action*='signin']",
-        "form[action*='signup']"
+        "form[action*='signup']",
+        "form[action*='register']",
+        "[data-automation-id='signInSubmitButton']"
     ]
     
     for selector in login_wall_selectors:
@@ -113,7 +132,11 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
     try:
         # Check for headings or buttons indicating login/registration wall
         headings = await p_page.locator("h1, h2, h3").all_inner_texts()
-        login_terms = ["sign in to your account", "log in to your account", "create an account", "register to apply", "sign up to continue"]
+        login_terms = [
+            "sign in to your account", "log in to your account",
+            "create an account", "register to apply", "sign up to continue",
+            "sign in with your account", "create account to apply"
+        ]
         for heading in headings:
             heading_lower = heading.lower()
             if any(term in heading_lower for term in login_terms):
@@ -122,3 +145,4 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
         logger.debug(f"Error checking headings: {e}")
 
     return False, ""
+

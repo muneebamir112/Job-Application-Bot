@@ -45,7 +45,7 @@ class SheetSync:
             self.col_indices = {header.strip().lower(): i + 1 for i, header in enumerate(self.headers)}
             
             # Verify required columns are present
-            required_cols = ["company name", "job title", "job link", "status", "date added"]
+            required_cols = ["company name", "job title", "job link", "date added"]
             for col in required_cols:
                 if col not in self.col_indices:
                     # Try fuzzy mapping or create fallback
@@ -87,6 +87,20 @@ class SheetSync:
             if not link:
                 continue
 
+            # If the job has already been applied to by ANY profile (or manually marked), skip it entirely
+            already_applied = False
+            if profiles_to_check:
+                for profile_name in profiles_to_check:
+                    p_col = self.col_indices.get(profile_name.lower())
+                    if p_col and len(row) >= p_col:
+                        p_status = row[p_col - 1].strip().lower()
+                        if "submitted" in p_status or "applied" in p_status:
+                            already_applied = True
+                            break
+            
+            if already_applied:
+                continue
+
             # Identify profiles to apply for
             profiles_to_apply = {}
             if profiles_to_check:
@@ -94,11 +108,12 @@ class SheetSync:
                     p_col = self.col_indices.get(profile_name.lower())
                     if p_col and len(row) >= p_col:
                         p_status = row[p_col - 1].strip()
-                        # Only apply if it's "Generated" or if it's "Failed" and retry_failed is true
                         should_apply = False
                         if p_status == "Generated":
                             should_apply = True
-                        elif p_status == "Failed" and retry_failed:
+                        elif retry_failed and "Failed" in p_status:
+                            should_apply = True
+                        elif retry_human_attention and "Human Attention" in p_status:
                             should_apply = True
                         
                         if should_apply:
@@ -158,3 +173,44 @@ class SheetSync:
             logger.info(f"Updated Sheet row {row_index}, col {col_index} profile status to: '{status}'")
         except Exception as e:
             logger.error(f"Failed to update sheet row {row_index} col {col_index} profile status: {e}")
+
+    def log_form_answers(self, profile_name: str, ollama_answers: list):
+        """
+        Appends Ollama generated Q&A to 'Sheet3' in the same Google Sheet.
+        Writes the header row automatically if the sheet is empty.
+
+        ollama_answers: list of dicts with keys: system_prompt, question, answer
+        """
+        ANSWERS_SHEET_NAME = "Sheet3"
+        HEADERS = ["Profile Name", "System Prompt", "Question", "Answer"]
+
+        if not ollama_answers:
+            return
+
+        try:
+            spreadsheet = self.client.open_by_key(config.GOOGLE_SHEET_ID)
+            ws = spreadsheet.worksheet(ANSWERS_SHEET_NAME)
+
+            # Write headers if the sheet is completely empty
+            existing = ws.row_values(1)
+            if not existing or not any(existing):
+                ws.append_row(HEADERS)
+                logger.info(f"Wrote headers to '{ANSWERS_SHEET_NAME}'.")
+
+            rows = []
+            for qa in ollama_answers:
+                answer = str(qa.get("answer") or "")
+                if len(answer) > 4000:
+                    answer = answer[:3997] + "..."
+                rows.append([
+                    profile_name,
+                    qa.get("system_prompt", ""),
+                    qa.get("question", ""),
+                    answer,
+                ])
+
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+            logger.info(f"Logged {len(rows)} form answers to '{ANSWERS_SHEET_NAME}'.")
+
+        except Exception as e:
+            logger.error(f"Failed to log form answers to '{ANSWERS_SHEET_NAME}': {e}")
