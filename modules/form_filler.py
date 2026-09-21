@@ -56,9 +56,11 @@ PROFILE_FIELD_SYNONYMS = {
     # middle_name: intentionally absent from open-ended matching — handled as a
     # special identity field below. The bot leaves it blank if not in profile.
     "middle_name": ["middle name", "middle initial"],
-    "last_name": ["last name", "surname", "family name"],
-    # secondary_last_name: secondary/maiden name — intentionally left blank (not in profile)
+    # secondary_last_name MUST come before last_name — "secondary last name" contains "last name"
+    # so if last_name is checked first it would steal the match. We return None for this key
+    # so that secondary/maiden name fields are always left blank.
     "secondary_last_name": ["secondary last name", "second last name", "second surname", "maiden name", "previous last name", "former last name"],
+    "last_name": ["last name", "surname", "family name"],
     "full_name": ["full name", "your name", "candidate name", "applicant name", "legal name", "name", "enter your name", "what is your name"],
     "email": ["email", "e-mail", "email address", "e-mail address"],
     "phone": ["phone", "mobile", "telephone", "phone number", "contact number"],
@@ -2502,9 +2504,9 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
                     value = await ask_ollama_open_ended(label, profile, job_logger, "OPEN_ENDED")
 
             if not value:
-                # middle_name, social profiles, website/portfolio specifically: expected to be absent for many candidates.
+                # middle_name, secondary_last_name, social profiles, website/portfolio specifically: expected to be absent for many candidates.
                 # Log at INFO, not WARNING, and leave the field blank — never Ollama.
-                if matched_key in ("middle_name", "facebook", "instagram", "youtube", "twitter", "github", "portfolio"):
+                if matched_key in ("middle_name", "secondary_last_name", "facebook", "instagram", "youtube", "twitter", "github", "portfolio"):
                     job_logger.info(f"No {matched_key} in profile — leaving '{label}' blank.")
                 else:
                     job_logger.warning(f"Profile field '{matched_key}' has no value for '{label}'. Skipping (Ollama not used for profile fields).")
@@ -3554,6 +3556,37 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
                 await _add(container, "yesno")
         except Exception:
             continue
+
+    # SmartRecruiters spl-input combobox discovery:
+    # spl-input is a custom web component used by SmartRecruiters for EEO/compliance
+    # dropdowns (Gender, Race/Ethnicity, Protected Veteran, etc.). It does NOT appear
+    # in the giant_selector because [role='combobox'] is inside its shadow root, not
+    # on the host element. We query spl-input elements directly and add them as comboboxes.
+    try:
+        spl_inputs = await frame.query_selector_all("spl-input")
+        existing_ids = set()
+        for t in tasks:
+            try:
+                eid = await t[2].get_attribute("id") or ""
+                if eid:
+                    existing_ids.add(eid)
+            except Exception:
+                pass
+        for spl_elem in spl_inputs:
+            try:
+                if not await spl_elem.is_visible():
+                    continue
+                if await is_chat_or_support_element(spl_elem):
+                    continue
+                spl_id = (await spl_elem.get_attribute("id") or "").strip()
+                if spl_id and spl_id in existing_ids:
+                    continue  # already discovered
+                await _add(spl_elem, "combobox")
+                job_logger.debug(f"Discovered SmartRecruiters spl-input combobox: id='{spl_id}'")
+            except Exception:
+                continue
+    except Exception:
+        pass
 
     # Single top-to-bottom pass, ordered strictly by DOM discovery order.
     tasks.sort(key=lambda t: t[0])
