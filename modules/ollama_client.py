@@ -4,7 +4,7 @@ import time
 import config
 from modules.logger import logger
 
-def query_ollama(prompt: str, system_prompt: str = "", timeout: int = None) -> str:
+def query_ollama(prompt: str, system_prompt: str = "", timeout: int = None, options: dict = None) -> str:
     """
     Sends a generation prompt to the local Ollama API.
     Handles retries and connection failures gracefully.
@@ -19,6 +19,8 @@ def query_ollama(prompt: str, system_prompt: str = "", timeout: int = None) -> s
     }
     if system_prompt:
         payload["system"] = system_prompt
+    if options:
+        payload["options"] = options
 
     for attempt in range(config.MAX_RETRIES):
         try:

@@ -29,7 +29,7 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
             if "recaptcha" in url or "hcaptcha" in url:
                 if "bframe" in url or "/challenge" in url:
                     # Escalated challenge frame - always blocking regardless of anchor mode
-                    return True, f"CAPTCHA challenge iframe detected: {url}"
+                    return "Human Attention", f"CAPTCHA challenge iframe detected: {url}"
                 if "size=invisible" in url:
                     # Runs silently, doesn't present anything to the user - not blocking
                     continue
@@ -37,25 +37,25 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
                 try:
                     frame_elem = await frame.frame_element()
                     if frame_elem and await frame_elem.is_visible():
-                        return True, f"CAPTCHA iframe detected: {url}"
+                        return "Human Attention", f"CAPTCHA iframe detected: {url}"
                     continue
                 except Exception:
-                    return True, f"CAPTCHA iframe detected: {url}"
+                    return "Human Attention", f"CAPTCHA iframe detected: {url}"
 
             if "cloudflare" in url or "challenges.cloudflare.com" in url or "turnstile" in url:
-                return True, f"Cloudflare Turnstile / challenge iframe detected: {url}"
+                return "Human Attention", f"Cloudflare Turnstile / challenge iframe detected: {url}"
 
             if "arkoselabs" in url or "funcaptcha" in url:
-                return True, f"Arkose / FunCaptcha iframe detected: {url}"
+                return "Human Attention", f"Arkose / FunCaptcha iframe detected: {url}"
 
             if "datadome" in url or "captcha-delivery.com" in url:
-                return True, f"DataDome CAPTCHA iframe detected: {url}"
+                return "Human Attention", f"DataDome CAPTCHA iframe detected: {url}"
 
             if "awswaf" in url or "token.awswaf.com" in url:
-                return True, f"AWS WAF CAPTCHA iframe detected: {url}"
+                return "Human Attention", f"AWS WAF CAPTCHA iframe detected: {url}"
 
             if "geetest" in url:
-                return True, f"GeeTest CAPTCHA iframe detected: {url}"
+                return "Human Attention", f"GeeTest CAPTCHA iframe detected: {url}"
     except Exception as e:
         logger.debug(f"Error checking frames: {e}")
 
@@ -81,7 +81,7 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
             elements = await p_page.locator(selector).all()
             for elem in elements:
                 if await elem.is_visible():
-                    return True, f"CAPTCHA element detected: {selector}"
+                    return "Human Attention", f"CAPTCHA element detected: {selector}"
         except Exception as e:
             logger.debug(f"Error checking selector {selector}: {e}")
 
@@ -102,9 +102,79 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
         ]
         for pattern in captcha_text_patterns:
             if pattern in body_text_lower:
-                return True, f"CAPTCHA text pattern detected: '{pattern}'"
+                return "Human Attention", f"CAPTCHA text pattern detected: '{pattern}'"
     except Exception as e:
         logger.debug(f"Error checking body text: {e}")
+
+    # --- 3.5 OTP / Verification Code Detection ---
+    try:
+        otp_text_patterns = [
+            "verification code was sent",
+            "verification code has been sent",
+            "a verification code was sent",
+            "enter the 8-character code",
+            "enter the 6-digit code",
+            "code to confirm you're a human",
+            "code to confirm you are a human",
+            "enter the verification code",
+            "enter verification code",
+            "enter the security code",
+            "enter security code",
+            "one-time password",
+            "one-time passcode",
+            "one-time verification code",
+            "security code"
+        ]
+        for frame in p_page.frames:
+            try:
+                # Check rendered text
+                frame_text = (await frame.inner_text("body")).lower()
+                for pattern in otp_text_patterns:
+                    if pattern in frame_text:
+                        return "OTP Required", f"OTP / verification code prompt detected: '{pattern}'"
+
+                # Check headings and labels
+                headings = await frame.locator("h1, h2, h3, h4, label, [role='heading']").all_inner_texts()
+                for h in headings:
+                    h_lower = h.lower().strip()
+                    if any(kw in h_lower for kw in ["security code", "verification code", "enter code"]):
+                        return "OTP Required", f"OTP / verification code heading detected: '{h}'"
+            except Exception:
+                pass
+
+        otp_selectors = [
+            "[autocomplete='one-time-code']",
+            "[data-automation-id*='verificationCode']",
+            "[data-automation-id*='securityCode']",
+            "[data-automation-id*='otp']",
+            "[data-qa*='security-code']",
+            "[data-qa*='verification-code']",
+            "label:has-text('Security code')",
+            "label:has-text('Security Code')",
+            "label:has-text('Verification code')",
+            "[class*='security-code']",
+            "[class*='verification-code']",
+            "[id*='security_code']",
+            "[id*='verification_code']",
+            "[id*='security-code']",
+            "[id*='verification-code']",
+            "input[name*='verification_code']",
+            "input[name*='security_code']",
+            "input[name*='otp']",
+            "input[aria-label*='security code' i]",
+            "input[aria-label*='verification code' i]"
+        ]
+        for frame in p_page.frames:
+            for selector in otp_selectors:
+                try:
+                    elements = await frame.locator(selector).all()
+                    for elem in elements:
+                        if await elem.is_visible():
+                            return "OTP Required", f"OTP / verification code input detected: {selector}"
+                except Exception as e:
+                    logger.debug(f"Error checking OTP selector {selector}: {e}")
+    except Exception as e:
+        logger.debug(f"Error checking OTP detection: {e}")
 
     # --- 4. Login / Account Creation wall detection ---
     login_wall_selectors = [
@@ -113,36 +183,38 @@ async def detect_captcha_or_login_wall(page) -> tuple[bool, str]:
         "form[action*='signin']",
         "form[action*='signup']",
         "form[action*='register']",
-        "[data-automation-id='signInSubmitButton']"
+        "[data-automation-id='signInSubmitButton']",
+        "[data-automation-id='createAccountSubmitButton']",
+        "button:has-text('Create Account')",
+        "button:has-text('Sign In')",
+        "button:has-text('Log In')"
     ]
     
-    for selector in login_wall_selectors:
-        try:
-            elements = await p_page.locator(selector).all()
-            for elem in elements:
-                if await elem.is_visible():
-                    # Double check if this is indeed a login form rather than a field
-                    # For password fields, it's almost always a login/signup blocker
-                    if selector == "input[type='password']":
-                        return True, "Login/signup wall: password input visible"
-                    return True, f"Login/signup wall element: {selector}"
-        except Exception as e:
-            logger.debug(f"Error checking login selector {selector}: {e}")
+    for frame in p_page.frames:
+        for selector in login_wall_selectors:
+            try:
+                elements = await frame.locator(selector).all()
+                for elem in elements:
+                    if await elem.is_visible():
+                        return "Sign In Required", f"Login/signup wall element: {selector}"
+            except Exception as e:
+                logger.debug(f"Error checking login selector {selector}: {e}")
 
     try:
         # Check for headings or buttons indicating login/registration wall
-        headings = await p_page.locator("h1, h2, h3").all_inner_texts()
-        login_terms = [
-            "sign in to your account", "log in to your account",
-            "create an account", "register to apply", "sign up to continue",
-            "sign in with your account", "create account to apply"
-        ]
-        for heading in headings:
-            heading_lower = heading.lower()
-            if any(term in heading_lower for term in login_terms):
-                return True, f"Login/signup wall heading detected: '{heading}'"
+        for frame in p_page.frames:
+            headings = await frame.locator("h1, h2, h3, h4, [role='heading']").all_inner_texts()
+            login_terms = [
+                "sign in", "log in", "create account", "create an account",
+                "register to apply", "sign up", "password requirements",
+                "verify new password", "already have an account"
+            ]
+            for heading in headings:
+                heading_lower = heading.lower().strip()
+                if any(term in heading_lower for term in login_terms):
+                    return "Sign In Required", f"Login/signup wall heading detected: '{heading}'"
     except Exception as e:
         logger.debug(f"Error checking headings: {e}")
 
-    return False, ""
+    return None, ""
 

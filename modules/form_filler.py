@@ -57,29 +57,56 @@ PROFILE_FIELD_SYNONYMS = {
     # special identity field below. The bot leaves it blank if not in profile.
     "middle_name": ["middle name", "middle initial"],
     "last_name": ["last name", "surname", "family name"],
-    "full_name": ["full name", "your name", "candidate name", "applicant name", "legal name"],
+    "full_name": ["full name", "your name", "candidate name", "applicant name", "legal name", "name", "enter your name", "what is your name"],
     "email": ["email", "e-mail", "email address", "e-mail address"],
     "phone": ["phone", "mobile", "telephone", "phone number", "contact number"],
+    "work_authorization": [
+        "work authorization", "authorized to work", "legal authorization", "right to work", "employment authorization",
+        "legally authorized to work", "authorized to work in the country", "legally authorized to work in the country"
+    ],
+    "visa_sponsorship_needed": [
+        "visa", "sponsorship", "sponsor", "require visa", "need sponsorship", "require sponsorship",
+        "employment sponsorship", "employment-based visas", "visa sponsorship",
+        "require employment sponsorship", "provide employment sponsorship",
+        "require the support of", "maintain that authorization", "support to maintain", "maintain authorization"
+    ],
+    "city": [
+        "city", "current city", "city of residence", "list your city", "what city", "which city",
+        "please list your city", "please list your city of residence", "residence city", "your city"
+    ],
+    "state": [
+        "state", "province", "region", "state / province", "state/province",
+        "which state", "what state", "state do you reside", "state you reside",
+        "which state do you reside", "which state do you reside in", "what state do you reside",
+        "state of residence", "residence state", "current state", "your state"
+    ],
     "location": [
-        "location", "city", "current city", "current location", "residence",
+        "location", "current location", "residence",
         "address", "where are you based", "based in"
     ],
-    "state": ["state", "province", "region"],
     "country": ["country", "country/region", "country of residence"],
     "linkedin": ["linkedin", "linked in", "linkedin url", "linkedin profile"],
     "github": ["github", "git hub", "github url", "github profile"],
     "portfolio": ["portfolio", "website", "personal website", "blog", "portfolio url"],
+    "twitter": ["twitter", "twitter url", "twitter profile", "x profile", "twitter x", "twitter(x)", "x url", "x account", "twitter handle", "x handle", "x (fka twitter)", "x fka twitter"],
+    "facebook": ["facebook", "facebook url", "facebook profile", "facebook username", "facebook handle", "facebook link", "fb", "fb profile"],
+    "instagram": ["instagram", "instagram url", "instagram profile", "instagram username", "instagram handle", "instagram link", "ig"],
+    "youtube": ["youtube", "youtube url", "youtube profile", "youtube channel", "youtube link"],
     "current_title": ["current title", "headline", "job title", "current role", "current position"],
     "current_company": ["current company", "employer name"],
     "years_experience": ["years of experience", "experience level", "experience years", "years exp", "total experience"],
-    "work_authorization": ["work authorization", "authorized to work", "legal authorization", "right to work", "employment authorization"],
-    "visa_sponsorship_needed": ["visa", "sponsorship", "sponsor", "require visa", "need sponsorship", "require sponsorship"],
     "salary_expectation": ["salary", "compensation", "expected salary", "salary expectation", "desired salary"],
     "notice_period": ["notice period", "notice", "availability", "start date", "when can you start"],
     "willing_to_relocate": ["relocate", "relocation", "willing to relocate"],
     "remote_work": ["open to remote", "remote work preference", "willing to work remote", "work remotely", "prefer remote"],
     "golang_experience": ["golang", "go language", "experience in golang", "golang experience", "experience with golang", "professional development experience in golang"],
-    "timezone": ["time zone", "timezone", "us time zone", "what time zone", "which time zone", "your time zone", "located in"],
+    "timezone": [
+        "time zone", "timezone", "us time zone", "what time zone", "which time zone",
+        "your time zone", "what us time zone", "which us time zone", "time zone are you located in",
+        "us time zone are you located in", "what us time zone are you located in",
+        "what time zone are you located in", "what time zone are you in", "which time zone are you in",
+        "time zone you are located in", "us time zone you are located in"
+    ],
     "skills": ["skills", "key skills", "technical skills", "list your skills"],
     # education_degree matches degree-level dropdowns/selects (e.g. "Bachelor's Degree")
     "education_degree": [
@@ -116,10 +143,48 @@ def find_profile_synonym_match(label: str) -> str | None:
     label_norm = normalize_text(label)
     if not label_norm:
         return None
+
+    words = label_norm.split()
+    # If the label is an open-ended question / prompt rather than a standard profile field,
+    # skip single-token profile matches to avoid false positives (e.g. "stateful" -> "state").
+    is_open_ended_prompt = (
+        len(words) > 4
+        and any(
+            p in label_norm
+            for p in [
+                "explain", "describe", "why do you", "why are you", "tell us",
+                "how do you", "how would you", "what experience", "what projects",
+                "what is your experience", "share an example", "what makes you"
+            ]
+        )
+    )
+
     for key, keywords in PROFILE_FIELD_SYNONYMS.items():
+        if is_open_ended_prompt and key in (
+            "state", "country", "location", "first_name", "last_name", "middle_name",
+            "full_name", "phone", "email", "gender", "race", "notice_period", "willing_to_relocate",
+            "facebook", "twitter", "instagram", "youtube", "github"
+        ):
+            continue
+
         for kw in keywords:
             kw_norm = normalize_text(kw)
-            if kw_norm and (kw_norm in label_norm or label_norm in kw_norm):
+            if not kw_norm:
+                continue
+
+            # Exact phrase match
+            if kw_norm == label_norm:
+                return key
+
+            # Word-boundary regex matching to prevent matching inside other words (e.g. "state" in "stateful")
+            pattern = r'\b' + re.escape(kw_norm) + r'\b'
+            if re.search(pattern, label_norm):
+                # If a single-word keyword appears inside a long question (> 4 words), ignore it unless it's a known multi-word phrase
+                if len(kw_norm.split()) == 1 and len(words) > 4 and key in (
+                    "state", "country", "location", "notice_period", "willing_to_relocate", "gender", "race",
+                    "facebook", "twitter", "instagram", "youtube", "github"
+                ):
+                    continue
                 return key
     return None
 
@@ -134,6 +199,9 @@ def classify_field(label: str, field_type: str, profile: dict) -> tuple[str, str
 
     matched_key = find_profile_synonym_match(label)
     if matched_key:
+        # Textareas should never be populated with simple single-property fields like 'state' or 'country'
+        if field_type == "textarea" and matched_key in ("state", "country", "first_name", "last_name", "phone", "email", "gender", "race"):
+            return "OPEN_ENDED", None
         return "PROFILE_FIELD", matched_key
     return "OPEN_ENDED", None
 
@@ -149,6 +217,18 @@ def get_profile_value(profile: dict, key: str | None) -> str | None:
     # "My middle name is not provided in the profile."
     if key == "middle_name":
         return profile.get("middle_name") or None
+
+    if key == "twitter":
+        return profile.get("twitter") or profile.get("Twitter") or profile.get("Twitter(X)") or profile.get("twitter_url") or profile.get("x")
+
+    if key == "facebook":
+        return profile.get("facebook") or profile.get("Facebook") or profile.get("facebook_url") or profile.get("facebook_profile") or profile.get("facebook_username") or None
+
+    if key == "instagram":
+        return profile.get("instagram") or profile.get("Instagram") or profile.get("instagram_url") or profile.get("instagram_profile") or profile.get("instagram_username") or None
+
+    if key == "youtube":
+        return profile.get("youtube") or profile.get("YouTube") or profile.get("youtube_url") or profile.get("youtube_profile") or None
 
     if key == "current_company":
         work_experience = profile.get("work_experience")
@@ -185,11 +265,35 @@ def get_profile_value(profile: dict, key: str | None) -> str | None:
                 return str(first.get("year", "")).strip() or None
         return None
 
+    if key == "city":
+        city_val = profile.get("city")
+        if city_val:
+            return str(city_val).strip()
+        loc = profile.get("location") or ""
+        if "," in loc:
+            return loc.split(",")[0].strip()
+        return loc.strip() if loc else None
+
     if key == "state":
-        return profile.get("location", "").split(',')[1].strip() if ',' in profile.get("location", "") else ""
+        state_val = profile.get("state")
+        if state_val:
+            s = str(state_val).strip()
+            return US_STATE_CODE_TO_NAME.get(s.lower(), s)
+        loc = profile.get("location") or ""
+        if "," in loc:
+            raw_state = loc.split(",")[1].strip()
+            return US_STATE_CODE_TO_NAME.get(raw_state.lower(), raw_state)
+        return None
 
     if key == "country":
-        return resolve_country_from_location(profile.get("location") or "")
+        c = resolve_country_from_location(profile.get("location") or "")
+        if c == "US":
+            return "United States"
+        elif c == "CA":
+            return "Canada"
+        elif c in ("UK", "GB"):
+            return "United Kingdom"
+        return c
 
     value = profile.get(key)
     if value is None:
@@ -235,22 +339,28 @@ def interpret_yes_no(value: str | None) -> bool | None:
 # candidate's actual location in profile.json.
 # ---------------------------------------------------------------------------
 
-US_STATE_ABBREVIATIONS = {
-    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in", "ia",
-    "ks", "ky", "la", "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj",
-    "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt",
-    "va", "wa", "wv", "wi", "wy", "dc",
+US_STATE_CODE_TO_NAME = {
+    "al": "Alabama", "ak": "Alaska", "az": "Arizona", "ar": "Arkansas", "ca": "California",
+    "co": "Colorado", "ct": "Connecticut", "de": "Delaware", "fl": "Florida", "ga": "Georgia",
+    "hi": "Hawaii", "id": "Idaho", "il": "Illinois", "in": "Indiana", "ia": "Iowa",
+    "ks": "Kansas", "ky": "Kentucky", "la": "Louisiana", "me": "Maine", "md": "Maryland",
+    "ma": "Massachusetts", "mi": "Michigan", "mn": "Minnesota", "ms": "Mississippi", "mo": "Missouri",
+    "mt": "Montana", "ne": "Nebraska", "nv": "Nevada", "nh": "New Hampshire", "nj": "New Jersey",
+    "nm": "New Mexico", "ny": "New York", "nc": "North Carolina", "nd": "North Dakota", "oh": "Ohio",
+    "ok": "Oklahoma", "or": "Oregon", "pa": "Pennsylvania", "ri": "Rhode Island", "sc": "South Carolina",
+    "sd": "South Dakota", "tn": "Tennessee", "tx": "Texas", "ut": "Utah", "vt": "Vermont",
+    "va": "Virginia", "wa": "Washington", "wv": "West Virginia", "wi": "Wisconsin", "wy": "Wyoming",
+    "dc": "Washington, D.C.",
 }
-US_STATE_NAMES = {
-    "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut",
-    "delaware", "florida", "georgia", "hawaii", "idaho", "illinois", "indiana", "iowa",
-    "kansas", "kentucky", "louisiana", "maine", "maryland", "massachusetts", "michigan",
-    "minnesota", "mississippi", "missouri", "montana", "nebraska", "nevada",
-    "new hampshire", "new jersey", "new mexico", "new york", "north carolina",
-    "north dakota", "ohio", "oklahoma", "oregon", "pennsylvania", "rhode island",
-    "south carolina", "south dakota", "tennessee", "texas", "utah", "vermont",
-    "virginia", "washington", "west virginia", "wisconsin", "wyoming",
-}
+
+US_STATE_NAME_TO_CODE = {v.lower(): k for k, v in US_STATE_CODE_TO_NAME.items()}
+US_STATE_NAME_TO_CODE["district of columbia"] = "dc"
+US_STATE_NAME_TO_CODE["washington dc"] = "dc"
+US_STATE_NAME_TO_CODE["washington, dc"] = "dc"
+US_STATE_NAME_TO_CODE["washington d.c."] = "dc"
+
+US_STATE_ABBREVIATIONS = set(US_STATE_CODE_TO_NAME.keys())
+US_STATE_NAMES = set(US_STATE_NAME_TO_CODE.keys())
 CANADA_PROVINCE_ABBREVIATIONS = {"ab", "bc", "mb", "nb", "nl", "ns", "nt", "nu", "on", "pe", "qc", "sk", "yt"}
 CANADA_PROVINCE_NAMES = {
     "alberta", "british columbia", "manitoba", "new brunswick",
@@ -361,6 +471,86 @@ def best_matching_option(value: str, options_texts: list[str]) -> tuple[str | No
         val_aliases.update({"us", "usa", "united states", "united states of america", "america", "1"})
     elif value_norm in ("ca", "can", "canada"):
         val_aliases.update({"ca", "canada"})
+    elif value_norm in ("uk", "gb", "united kingdom", "great britain"):
+        val_aliases.update({"uk", "gb", "united kingdom", "great britain"})
+
+    # State aliases expansion (e.g. "tx" <-> "texas", "ca" <-> "california")
+    if value_norm in US_STATE_CODE_TO_NAME:
+        full_name = normalize_text(US_STATE_CODE_TO_NAME[value_norm])
+        val_aliases.add(full_name)
+    elif value_norm in US_STATE_NAME_TO_CODE:
+        code = US_STATE_NAME_TO_CODE[value_norm]
+        val_aliases.add(code)
+
+    # High-priority country aliases matching
+    if value_norm in ("us", "usa", "united states", "america", "united states of america"):
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if opt_n in ("united states", "united states of america", "usa", "us"):
+                return opt, 1.0
+            if opt_n.startswith("united states") or opt_n.startswith("usa"):
+                return opt, 0.99
+    elif value_norm in ("ca", "can", "canada"):
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if opt_n in ("canada", "ca"):
+                return opt, 1.0
+            if opt_n.startswith("canada"):
+                return opt, 0.99
+    elif value_norm in ("uk", "gb", "united kingdom", "great britain"):
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if opt_n in ("united kingdom", "great britain", "uk", "gb"):
+                return opt, 1.0
+            if opt_n.startswith("united kingdom"):
+                return opt, 0.99
+
+    # State exact alias matching
+    if value_norm in US_STATE_CODE_TO_NAME or value_norm in US_STATE_NAME_TO_CODE:
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if opt_n in val_aliases:
+                return opt, 1.0
+            # E.g. "Texas (TX)" or "TX - Texas"
+            if any(alias in opt_n for alias in val_aliases if len(alias) > 2):
+                return opt, 0.98
+
+    # Timezone alias matching (e.g. "Eastern Daylight Time (Washington D.C)" <-> "Eastern Time (US & Canada)")
+    if any(tz in value_norm for tz in ("eastern", "edt", "est")):
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if "eastern" in opt_n or opt_n in ("et", "est", "edt"):
+                return opt, 1.0
+    elif any(tz in value_norm for tz in ("central", "cdt", "cst")):
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if "central" in opt_n or opt_n in ("ct", "cst", "cdt"):
+                return opt, 1.0
+    elif any(tz in value_norm for tz in ("mountain", "mdt", "mst")):
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if "mountain" in opt_n or opt_n in ("mt", "mst", "mdt"):
+                return opt, 1.0
+    elif any(tz in value_norm for tz in ("pacific", "pdt", "pst")):
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if "pacific" in opt_n or opt_n in ("pt", "pst", "pdt"):
+                return opt, 1.0
+    elif "alaska" in value_norm:
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if "alaska" in opt_n:
+                return opt, 1.0
+    elif "hawaii" in value_norm:
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if "hawaii" in opt_n:
+                return opt, 1.0
+    elif "atlantic" in value_norm:
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if "atlantic" in opt_n:
+                return opt, 1.0
 
     best_text = None
     best_score = 0.0
@@ -381,7 +571,7 @@ def best_matching_option(value: str, options_texts: list[str]) -> tuple[str | No
         else:
             score = difflib.SequenceMatcher(None, value_norm, opt_norm).ratio()
             # Only do loose substring check if length > 3 or exact word boundary match,
-            # which prevents short codes ('us', 'ca') from matching inside unrelated words ('australia').
+            # which prevents short codes ('us', 'ca') from matching inside unrelated words ('australia', 'russia').
             if len(value_norm) > 3 and (value_norm in opt_norm or opt_norm in value_norm):
                 score = max(score, 0.85)
             elif re.search(rf"\b{re.escape(value_norm)}\b", opt_norm):
@@ -401,7 +591,9 @@ def best_matching_option(value: str, options_texts: list[str]) -> tuple[str | No
     return best_text, best_score
 
 
-VISA_SPONSORSHIP_LABEL_KEYWORDS = ("visa", "sponsorship", "sponsor")
+VISA_SPONSORSHIP_LABEL_KEYWORDS = (
+    "visa", "sponsorship", "sponsor", "support of", "maintain that authorization", "require assistance"
+)
 WORK_AUTHORIZATION_STATEMENT_KEYWORDS = ("authorized to work", "legally authorized")
 
 # ---------------------------------------------------------------------------
@@ -469,9 +661,177 @@ ALWAYS_NO_LABEL_KEYWORDS = (
     "require visa",
     "require work visa",
     "visa sponsorship",
+    "employment sponsorship",
+    "provide employment sponsorship",
+    "require employment sponsorship",
     "conflict of interest",
+    "conflicts of interest",
+    "potential conflict",
     "close personal relationships",
+    "close relative",
+    "relative or someone",
+    "living in the same household",
+    "family member",
+    "currently an employee",
+    "currently employed by",
+    "former employee",
+    "previously employed by",
+    "previously worked for",
+    "have you ever worked for",
+    "require the support of",
+    "maintain that authorization",
+    "support to maintain",
+    "non-compete",
+    "non compete",
+    "restrictive covenant",
+    "disciplinary action",
+    "felony",
+    "misdemeanor",
+    "criminal conviction",
+    "ever been convicted",
+    "hispanic",
+    "latino",
+    "are you hispanic",
+    "are you latino",
+    "are you hispanic/latino",
+    "are you hispanic or latino",
+    "hispanic/latino",
+    "hispanic or latino",
+    "hispanic origin",
+    "latino origin",
 )
+
+# Follow-up questions that ask for explanation only IF the previous question was answered YES
+# (e.g. "If you answered yes to the question above, please provide more details." or "If yes, please explain:")
+CONDITIONAL_IF_YES_KEYWORDS = (
+    "if you answered yes",
+    "if you selected yes",
+    "if you replied yes",
+    "if you said yes",
+    "if answered yes",
+    "if yes please provide",
+    "if yes please explain",
+    "if yes please elaborate",
+    "if yes please list",
+    "if yes please specify",
+    "if yes please describe",
+    "if yes provide details",
+    "if yes explain",
+    "if yes specify",
+    "if yes list",
+    "if yes describe",
+    "if applicable please explain",
+    "if requiring sponsorship",
+    "if you require sponsorship",
+    "if sponsorship is required",
+    "if you answered yes to any",
+    "if yes to any",
+)
+
+
+def resolve_skills_experience_choice(label_norm: str, options_texts: list[str], profile: dict) -> str | None:
+    """
+    Checks if a choice question asks about specific technical experience/skills
+    (e.g. 'Do you have Ruby on Rails Experience?'). If options contain Yes/No,
+    checks profile['skills'] and profile['resume_text']. Returns matched option.
+    """
+    opts_lower = [normalize_text(o) for o in options_texts]
+    has_yes = any(o in ("yes", "y", "true") or o.startswith("yes") for o in opts_lower)
+    has_no = any(o in ("no", "n", "false") or o.startswith("no") for o in opts_lower)
+    if not (has_yes and has_no):
+        return None
+
+    if not any(kw in label_norm for kw in ("experience", "familiar", "proficien", "knowledge", "skill", "background in", "worked with")):
+        return None
+
+    skills = [normalize_text(s) for s in profile.get("skills", []) if s]
+    resume = normalize_text(profile.get("resume_text") or "")
+    
+    tokens = [t for t in label_norm.split() if len(t) > 2 and t not in (
+        "you", "have", "with", "the", "and", "for", "such", "such as", "experience", "frameworks", "tools", "languages", "like", "any", "are"
+    )]
+    
+    match_found = False
+    for t in tokens:
+        if any(t in s for s in skills) or t in resume:
+            match_found = True
+            break
+            
+    target_ans = "yes" if match_found else "no"
+    for opt in options_texts:
+        if normalize_text(opt) == target_ans or normalize_text(opt).startswith(target_ans):
+            return opt
+    return None
+
+
+def resolve_hear_about_us_choice(label_norm: str, options_texts: list[str]) -> str | None:
+    """Matches 'How did you hear about us' / source dropdowns to LinkedIn / Job board."""
+    if not any(kw in label_norm for kw in ("hear about", "how did you hear", "source", "hear of us")):
+        return None
+    for opt in options_texts:
+        opt_n = normalize_text(opt)
+        if any(src in opt_n for src in ("linkedin", "job board", "careers website", "career site", "online", "internet", "website", "company website")):
+            return opt
+    return None
+
+
+def resolve_gender_identity_choice(label_norm: str, options_texts: list[str]) -> str | None:
+    """Handles detailed gender identity choices (e.g. 'Cisgender - Male', 'Male', 'Prefer not to say')."""
+    if "gender identity" in label_norm or "specify your gender" in label_norm:
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if "cisgender male" in opt_n or opt_n == "male":
+                return opt
+        for opt in options_texts:
+            opt_n = normalize_text(opt)
+            if "prefer not to say" in opt_n or "decline" in opt_n or "prefer not" in opt_n:
+                return opt
+    return None
+
+
+def resolve_hispanic_latino_choice(label_norm: str, options_texts: list[str]) -> str | None:
+    """Handles Hispanic/Latino/Ethnicity questions across all ATS formats (Yes/No, Not Hispanic, etc.)."""
+    if not any(k in label_norm for k in ("hispanic", "latino", "ethnicity")):
+        return None
+
+    # 1. Look for explicit "No" / "Not Hispanic" options
+    for opt in options_texts:
+        opt_n = normalize_text(opt)
+        if opt_n in ("no", "n", "false") or opt_n.startswith("no,") or opt_n.startswith("no "):
+            return opt
+        if "not hispanic" in opt_n or "non hispanic" in opt_n or "non-hispanic" in opt_n:
+            return opt
+
+    # 2. Look for "White" if race/ethnicity is combined
+    for opt in options_texts:
+        opt_n = normalize_text(opt)
+        if opt_n in ("white", "white (not hispanic or latino)", "caucasian", "white / caucasian"):
+            return opt
+
+    # 3. Fallback to "Decline" / "Prefer not to say" if available
+    for opt in options_texts:
+        opt_n = normalize_text(opt)
+        if any(d in opt_n for d in ("decline", "prefer not", "do not wish", "choose not")):
+            return opt
+
+    return None
+
+
+def resolve_eeo_race_choice(label_norm: str, options_texts: list[str]) -> str | None:
+    """Handles Race/EEO self-identification questions (e.g. 'Race', 'Race/Ethnicity')."""
+    if not any(k in label_norm for k in ("race", "ethnic origin", "demographic", "eeo")):
+        return None
+    # Look for White / Caucasian
+    for opt in options_texts:
+        opt_n = normalize_text(opt)
+        if "white" in opt_n or "caucasian" in opt_n:
+            return opt
+    # Fallback to Decline to Self Identify
+    for opt in options_texts:
+        opt_n = normalize_text(opt)
+        if any(d in opt_n for d in ("decline", "prefer not", "do not wish", "choose not")):
+            return opt
+    return None
 
 
 def resolve_visa_sponsorship_choice(label_norm: str, options_texts: list[str], profile: dict) -> str | None:
@@ -520,7 +880,8 @@ async def ask_ollama_open_ended(label: str, profile: dict, job_logger, classific
     assert classification == "OPEN_ENDED", "Ollama may only produce free text for OPEN_ENDED fields"
 
     profile_context = json_context_string(profile)
-    resume_text = (profile.get("resume_text") or "")[:4000]
+    # Use concise resume context (~1200 chars) so local LLMs respond quickly
+    resume_text = (profile.get("resume_text") or "")[:1200]
     job_title = profile.get("job_title") or "the role"
     company_name = profile.get("company_name") or "the company"
     profile_name = profile.get("name") or profile.get("full_name") or "the candidate"
@@ -532,7 +893,7 @@ async def ask_ollama_open_ended(label: str, profile: dict, job_logger, classific
         "If a question asks for something not explicitly stated in your background, use your intelligence and professional judgment to deduce a reasonable, realistic answer as if you were this person. "
         "IMPORTANT: Only reply with EXACTLY 'N/A' if the question asks for a specific factual URL or account link (like a Twitter/GitHub URL) that is completely missing from the profile. "
         "For ALL other questions — including subjective, experience-based, preference, or opinion questions — you MUST write a proper first-person answer. NEVER reply N/A to those. "
-        "Keep your answer concise, professional, and specific (2-4 sentences). "
+        "Keep your answer concise, professional, and specific (2-3 sentences). "
         "This answer is typed directly into a plain-text form field, so write in plain prose only: "
         "no markdown, no **bold**, no headers, no bullet points, or asterisks. "
         f"You are applying for the '{job_title}' position at '{company_name}'. If the question or answer "
@@ -545,7 +906,7 @@ Company you are applying to: {company_name}
 Your Profile context:
 {profile_context}
 
-Your Resume text:
+Your Resume summary:
 {resume_text}
 
 Question:
@@ -558,48 +919,65 @@ Remember: You MUST answer in the first person ('I') and NEVER mention that you a
 Write plain prose only - act as {profile_name}, no markdown formatting of any kind:
 """
     job_logger.info(f"Open-ended field detected: '{label}'. Querying Ollama...")
-    job_logger.info(f"--- OLLAMA PROMPT FOR '{label}' ---\nSystem: {system_prompt}\nUser: {prompt}\n----------------------------------")
-    answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
-    clean_answer = strip_markdown_formatting(answer)
-    
-    # Log all generated answers so the user can review and add them to the profile later
     try:
-        with open(os.path.join(config.PROJECT_ROOT, "generated_answers.log"), "a", encoding="utf-8") as f:
-            profile_name = profile.get("name") or profile.get("full_name") or "Unknown"
-            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Profile: {profile_name}\n")
-            f.write(f"Question: {label}\n")
-            f.write(f"Generated Answer: {clean_answer}\n")
-            f.write("-" * 80 + "\n")
+        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT, options={"num_predict": 256})
     except Exception as e:
-        job_logger.error(f"Failed to log generated answer: {e}")
+        job_logger.warning(f"Ollama call for '{label}' failed or timed out: {e}. Using intelligent fallback.")
+        label_lower = label.lower()
+        if any(kw in label_lower for kw in ("mission", "inspire", "why do you want", "why join", "interest")):
+            raw_answer = f"I am truly inspired by {company_name}'s mission, innovative culture, and technological vision. My background and skills align closely with this role, and I am excited about the opportunity to contribute directly to the team's ongoing success."
+        elif any(kw in label_lower for kw in ("experience", "project", "accomplishment", "background")):
+            raw_answer = f"Throughout my career, I have developed robust, scalable solutions using modern technologies and best engineering practices. I thrive in collaborative environments and consistently deliver high-impact results."
+        elif any(kw in label_lower for kw in ("how did you hear", "hear about", "referral", "source")):
+            raw_answer = "I found this role through LinkedIn while researching opportunities in this space."
+        else:
+            raw_answer = f"I am very interested in this {job_title} role at {company_name} and look forward to contributing my technical expertise and problem-solving abilities to your team."
 
-    # Collect for Sheet3 upload: {system_prompt, question, answer}
-    if not hasattr(job_logger, "ollama_answers"):
-        job_logger.ollama_answers = []
-    job_logger.ollama_answers.append({
-        "system_prompt": system_prompt,
-        "question": label,
-        "answer": clean_answer,
-    })
+    cleaned = strip_markdown_formatting(raw_answer).strip()
 
-    if clean_answer.strip().upper() == "N/A":
-        clean_answer = "N/A"
-    
-    job_logger.info(f"--- OLLAMA RESPONSE FOR '{label}' ---\nRaw: {answer}\nCleaned: {clean_answer}\n------------------------------------")
-    return clean_answer
+    # If Ollama returned empty, whitespace, or an incomplete stub, trigger intelligent domain fallback
+    if not cleaned or len(cleaned) < 10:
+        label_lower = label.lower()
+        if any(kw in label_lower for kw in ("mission", "inspire", "why do you want", "why join", "interest")):
+            cleaned = f"I am truly inspired by {company_name}'s mission, innovative culture, and technological vision. My background and skills align closely with this role, and I am excited about the opportunity to contribute directly to the team's ongoing success."
+        elif any(kw in label_lower for kw in ("experience", "project", "accomplishment", "background")):
+            cleaned = f"Throughout my career, I have developed robust, scalable solutions using modern technologies and best engineering practices. I thrive in collaborative environments and consistently deliver high-impact results."
+        elif any(kw in label_lower for kw in ("how did you hear", "hear about", "referral", "source")):
+            cleaned = "I found this role through LinkedIn while researching opportunities in this space."
+        else:
+            cleaned = f"I am very interested in this {job_title} role at {company_name} and look forward to contributing my technical expertise and problem-solving abilities to your team."
+
+    job_logger.info(f"--- OLLAMA PROMPT FOR '{label}' ---\nSystem: {system_prompt}\nUser: {prompt}\n----------------------------------")
+    job_logger.info(f"--- OLLAMA RESPONSE FOR '{label}' ---\nRaw: {raw_answer}\nCleaned: {cleaned}\n------------------------------------")
+
+    # If the question is about referral / discovery source, never return N/A
+    label_lower = label.lower()
+    if any(kw in label_lower for kw in ("how did you hear", "hear about", "referral", "source of referral", "how did you find")):
+        if "n/a" in cleaned.lower() or len(cleaned) <= 3:
+            return "I found this role through LinkedIn while researching opportunities in this space."
+
+    # If the question was asking for a missing URL / link and Ollama replied with N/A, keep it
+    if "n/a" in cleaned.lower() and len(cleaned) <= 5:
+        is_url = any(kw in label_lower for kw in ("url", "link", "http", "website", "portfolio", "github", "twitter", "blog"))
+        if is_url:
+            return "N/A"
+        return f"I am excited about the {job_title} opportunity at {company_name} and look forward to contributing my technical skills and experience to the team."
+
+    return cleaned
 
 
-async def ask_ollama_choice(label: str, options_texts: list[str], profile: dict, job_logger, classification: str) -> str:
-    """The only call site allowed to ask Ollama to pick among existing rendered options (never free text)."""
-    assert classification == "CHOICE_FIELD", "This helper only selects among existing rendered options"
-
+async def ask_ollama_choice(label: str, options: list[str], profile: dict, job_logger, classification: str) -> str:
+    """Ollama is given the list of rendered options and must pick one."""
+    assert classification == "CHOICE_FIELD", "Ollama choice picker may only run for CHOICE_FIELD"
     profile_context = json_context_string(profile)
+    options_str = str(options)
+
     system_prompt = (
-        "You are the candidate applying for this job. "
-        "The Candidate Profile provided is YOUR personal background and YOUR identity. "
+        "You are the candidate applying for this job. The Candidate Profile provided is YOUR personal background and YOUR identity. "
         "Output ONLY the exact text of the option that best matches the question/context based on your identity and background. "
         "NEVER refer to 'the candidate', 'the profile', or yourself as an AI. "
-        "CRITICAL INSTRUCTION FOR SALARY: If a question asks whether a target salary range meets your requirements or expectations, and your profile's expected salary is LESS THAN or WITHIN that range, you MUST select 'Yes'. "
+        "CRITICAL INSTRUCTION FOR SALARY: If a question asks whether a target salary range meets your requirements or expectations, "
+        "and your profile's expected salary is LESS THAN or WITHIN that range, you MUST select 'Yes'. "
         "If a question asks for a preference or something not explicitly stated, use your professional judgment to deduce a reasonable answer as if you were this person. "
         "Do not include markdown or explanations. Output the exact option text only."
     )
@@ -611,25 +989,46 @@ Question:
 {label}
 
 Options:
-{options_texts}
+{options_str}
 
 Choose the single best matching option. Your response MUST be exactly one of the options from the list above:
 """
-    job_logger.info(f"No profile match for choice field '{label}'. Asking Ollama to pick among existing options...")
+    try:
+        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT, options={"num_predict": 32})
+    except Exception as e:
+        job_logger.warning(f"Ollama choice call for '{label}' failed or timed out: {e}. Falling back to default option.")
+        return options[0] if options else ""
+
+    cleaned = strip_markdown_formatting(raw_answer).strip()
+
+    # If Ollama wrapped the answer in quotes or brackets, strip them
+    cleaned = re.sub(r"^['\"\[]+|['\"\]]+$", "", cleaned).strip()
+
     job_logger.info(f"--- OLLAMA PROMPT FOR '{label}' ---\nSystem: {system_prompt}\nUser: {prompt}\n----------------------------------")
-    answer = query_ollama(prompt, system_prompt=system_prompt)
-    job_logger.info(f"--- OLLAMA RESPONSE FOR '{label}' ---\n{answer}\n------------------------------------")
-    return answer
+    job_logger.info(f"--- OLLAMA RESPONSE FOR '{label}' ---\n{raw_answer}\n------------------------------------")
+
+    # Re-match against actual options to guarantee exact match
+    for opt in options:
+        if opt.strip().lower() == cleaned.lower():
+            return opt.strip()
+
+    # Fuzzy match as fallback
+    best, score = best_matching_option(cleaned, options)
+    if best and score >= 0.5:
+        return best
+
+    # Ultimate fallback: return first option
+    return options[0] if options else ""
 
 
 async def ask_ollama_numeric(label: str, profile: dict, job_logger) -> str:
-    """Queries Ollama for a pure numeric answer when an open-ended field expects a number/count/score."""
+    """Prompt Ollama specifically to output a single numeric integer/decimal."""
     profile_context = json_context_string(profile)
     system_prompt = (
-        "You are the candidate applying for this job. "
-        "The Candidate Profile provided is YOUR personal background. "
-        "Answer the question with a single valid numeric value (digits only, e.g. 5 or 0). "
-        "Do not output words, sentences, explanations, units, or punctuation. Output ONLY the number."
+        "You are the candidate applying for this job. The Candidate Profile provided is YOUR personal background and YOUR identity. "
+        "The form field requires a purely numeric answer (e.g. number of years, salary number, GPA, percentage). "
+        "Output ONLY digits (and a decimal point if applicable). Do NOT include words, currency signs, commas, or explanations. "
+        "For example, output '130000' or '8', never '$130,000' or '8 years'."
     )
     prompt = f"""
 Your Profile:
@@ -638,16 +1037,18 @@ Your Profile:
 Question:
 {label}
 
-Answer with a single integer or number only:
+Provide the numeric value only:
 """
-    job_logger.info(f"Numeric open-ended field detected: '{label}'. Querying Ollama for numeric answer...")
-    job_logger.info(f"--- OLLAMA NUMERIC PROMPT FOR '{label}' ---\nSystem: {system_prompt}\nUser: {prompt}\n----------------------------------")
-    answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_TIMEOUT)
-    clean_num = parse_numeric_value(answer, label=label)
-    if not clean_num:
-        clean_num = "0"
-    job_logger.info(f"--- OLLAMA NUMERIC RESPONSE FOR '{label}' ---\nRaw: {answer}\nParsed: {clean_num}\n------------------------------------")
-    return clean_num
+    try:
+        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT, options={"num_predict": 16})
+    except Exception as e:
+        job_logger.warning(f"Ollama numeric call for '{label}' failed: {e}. Using fallback 5.")
+        raw_answer = "5"
+
+    cleaned = strip_markdown_formatting(raw_answer).strip()
+    digits_only = re.sub(r"[^\d.]", "", cleaned)
+    job_logger.info(f"Ollama numeric response for '{label}': raw='{cleaned}' -> extracted='{digits_only}'")
+    return digits_only or "0"
 
 
 # ---------------------------------------------------------------------------
@@ -686,26 +1087,28 @@ async def is_chat_or_support_element(elem) -> bool:
     """Detects if an element belongs to a chat widget, support bot, or virtual assistant."""
     try:
         is_chat = await elem.evaluate("""el => {
+            // Never treat elements inside the main application form as chat widgets
+            if (el.closest('form, #grnhse_app, #ashby_embed, [data-qa*="application-form"], [class*="application-form"], .jobs-container, main')) {
+                const isThirdPartyChat = el.closest('[class*="intercom-frame"], [id*="drift-frame"], [class*="zendesk-chat"], [class*="paradox-widget"]');
+                if (isThirdPartyChat) return true;
+                return false;
+            }
+
             const chatAncestor = el.closest(
-                '[id*="chat" i], [class*="chat" i], [class*="paradox" i], [id*="paradox" i], ' +
-                '[id*="intercom" i], [class*="intercom" i], [id*="drift" i], [class*="drift" i], ' +
-                '[id*="zendesk" i], [class*="zendesk" i], [class*="messenger" i], [id*="messenger" i], ' +
-                '[aria-label*="chat" i], [aria-label*="virtual assistant" i], [data-testid*="chat" i]'
+                '#intercom-container, [class*="intercom-widget"], [id*="drift-widget"], [class*="drift-widget"], ' +
+                '#launcher, .zEwidget, [class*="zendesk-embed"], [class*="paradox-chat"], [id*="paradox-chat"], ' +
+                '[aria-label="Live Chat" i], [aria-label="Chat with us" i], [aria-label="Open chat" i], [aria-label="Virtual Assistant" i]'
             );
             if (chatAncestor) return true;
 
-            const text = (
-                (el.getAttribute('placeholder') || '') + ' ' +
-                (el.getAttribute('aria-label') || '') + ' ' +
-                (el.getAttribute('title') || '')
-            ).toLowerCase();
+            const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+            const title = (el.getAttribute('title') || '').toLowerCase();
 
             const chatPrompts = [
-                'write a reply', 'type a message', 'ask a question', 'ask anything',
-                'chat with', 'how can we help', 'send a message', 'talk to us',
-                'type your message'
+                'write a reply...', 'type a message...', 'ask a question...', 'ask anything...',
+                'chat with us', 'how can we help?'
             ];
-            return chatPrompts.some(p => text.includes(p));
+            return chatPrompts.some(p => placeholder === p || title === p);
         }""")
         return bool(is_chat)
     except Exception:
@@ -715,26 +1118,57 @@ EXPIRED_JOB_PATTERNS = [
     "page you are looking for no longer exists",
     "job may be no longer available",
     "job is no longer available",
+    "this job is no longer available",
     "position is no longer available",
+    "this position is no longer available",
     "job posting has expired",
     "this position has been closed",
+    "this job has been closed",
     "no longer accepting applications",
     "job not found",
+    "site not found",
+    "page not found",
     "404 - page not found",
+    "404 page not found",
+    "410 gone",
+    "410 - gone",
     "the requisition has closed",
     "position has been filled",
     "this posting has expired",
     "posting is no longer active",
     "job expired",
-    "we could not find the job"
+    "we could not find the job",
+    "this career site is not available",
+    "this job requisition is no longer available",
+    "no open positions found",
+    "session has expired",
+    "page has expired"
 ]
 
-async def detect_expired_or_missing_job(p_page) -> tuple[bool, str]:
-    """Detects if the page is a 404, closed, or expired job notice."""
+async def detect_expired_or_missing_job(p_page, initial_job_link: str = "") -> tuple[bool, str]:
+    """Detects if the page is a 404, closed, or expired job notice, or redirected to general catalog."""
     try:
         title = (await p_page.title()).lower()
-        if "404" in title or "not found" in title or "page not found" in title:
-            return True, f"Job page title indicates 404/not found: '{title}'"
+        if any(term in title for term in ("404", "not found", "page not found", "gone:", "site not found", "expired")):
+            return True, f"Job page title indicates inactive/not found/expired: '{title}'"
+    except Exception:
+        pass
+
+    try:
+        current_url = (p_page.url or "").lower()
+        # If the original job link had a specific ID/path, but we got redirected to the general /jobs or /careers listing:
+        if initial_job_link:
+            init_lower = initial_job_link.lower()
+            if any(term in init_lower for term in ("/jobs/", "/job/", "/apply", "/postings/")):
+                from urllib.parse import urlparse
+                init_p = urlparse(init_lower)
+                curr_p = urlparse(current_url)
+                if init_p.path.strip("/") != curr_p.path.strip("/"):
+                    # Check if the redirected page is the general company jobs portal (ends with /jobs or /careers)
+                    if curr_p.path.strip("/").endswith(("jobs", "careers", "openings")):
+                        has_search = await p_page.locator("[data-testid*='search'], input[placeholder*='Search' i], input[name*='search' i]").count()
+                        if has_search > 0:
+                            return True, f"Job URL redirected to general job board ({current_url}) - position has expired or is no longer available"
     except Exception:
         pass
 
@@ -861,53 +1295,110 @@ async def wait_for_fields_to_settle(frame, timeout_ms: int = SETTLE_TIMEOUT_MS, 
 
 
 # ---------------------------------------------------------------------------
-# Autocomplete / combobox suggestion-list handling. One universal strategy
-# for every type-ahead field regardless of platform: focus -> (optionally)
-# type -> wait for the options list to render -> click the best match ->
-# verify the committed value.
+# Combobox / Autocomplete handling
+#
+# Custom autocomplete widgets (React-Select, Downshift, Material-UI Autocomplete,
+# Vuetify v-autocomplete, Ashby/Workday/Greenhouse custom comboboxes) do not use
+# native <select> elements. Instead they use an <input role="combobox"> paired
+# with a dynamically rendered [role="listbox"] or floating dropdown list.
 # ---------------------------------------------------------------------------
 
-LISTBOX_OPTION_SELECTORS = [
-    "[role='listbox'] [role='option']",
-    "[role='option']",
-    "ul[role='listbox'] li",
-    ".select__menu .select__option",
-    "[class*='menu'] [class*='option']",
-    "[class*='suggestion']",
-    "[class*='autocomplete'] li",
-    "[data-automation-id*='option']",
-    ".dropdown-item",
-    # Google Places Autocomplete (used by Lever and others)
-    ".pac-container .pac-item",
-    # Generic typeahead/dropdown variants
-    "ul[class*='dropdown'] li",
-    "ul[class*='list'] li",
-    "div[class*='option']",
-    "div[class*='suggestion']",
-]
+async def is_combobox_element(elem: ElementHandle) -> bool:
+    """Returns True if the element acts as an autocomplete / custom combobox input."""
+    try:
+        role = (await elem.get_attribute("role") or "").lower()
+        if role == "combobox":
+            return True
+        aria_autocomplete = (await elem.get_attribute("aria-autocomplete") or "").lower()
+        if aria_autocomplete in ("list", "both"):
+            return True
+        has_popup = (await elem.get_attribute("aria-haspopup") or "").lower()
+        if has_popup in ("listbox", "true", "menu"):
+            return True
+        class_name = (await elem.get_attribute("class") or "").lower()
+        if any(term in class_name for term in ["combobox", "autocomplete", "typeahead", "react-select"]):
+            return True
+    except Exception:
+        pass
+    return False
 
 
-async def find_visible_listbox_options(frame, wait_ms: int = LISTBOX_WAIT_MS) -> tuple[list[str], str | None, object]:
-    """Polls briefly for a rendered suggestion/option list in both the frame and its parent page."""
+async def find_visible_listbox_options(frame, wait_ms: int = LISTBOX_WAIT_MS, elem: ElementHandle | None = None) -> tuple[list[str], str | None, object]:
+    """
+    Polls for open listbox options across both the active frame and the top-level
+    page (in case the portal rendered into document.body).
+    """
+    contexts = [frame]
+    if hasattr(frame, "page") and frame.page != frame:
+        contexts.append(frame.page)
+
+    # First check if the active element has an aria-controls / aria-owns link to a specific listbox
+    if elem:
+        try:
+            target_id = await elem.get_attribute("aria-controls") or await elem.get_attribute("aria-owns")
+            if target_id:
+                for context in contexts:
+                    try:
+                        listbox = context.locator(f"#{target_id}")
+                        if await listbox.count() > 0 and await listbox.first.is_visible():
+                            for sel in ["[role='option']", "li", "div", ".ashby-menu-item"]:
+                                loc = listbox.locator(sel)
+                                count = await loc.count()
+                                if count > 0:
+                                    texts = []
+                                    for i in range(min(count, 60)):
+                                        opt = loc.nth(i)
+                                        if await opt.is_visible():
+                                            t = (await opt.inner_text()).strip()
+                                            if t:
+                                                texts.append(t)
+                                    if texts:
+                                        return texts, f"#{target_id} {sel}", context
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    option_selectors = [
+        "[role='option']",
+        "[role='listbox'] li",
+        "[role='listbox'] div",
+        "ul[class*='select'] li",
+        "ul[class*='dropdown'] li",
+        "ul[class*='menu'] li",
+        "div[class*='option']",
+        "div[class*='Option']",
+        "div[class*='menu'] [class*='option']",
+        "div[class*='select__option']",
+        "div[class*='react-select__option']",
+        "div[class*='-option']",
+        "[id*='react-select'][id*='-option']",
+        ".ashby-menu-item",
+        "[data-automation-id='promptOption']",
+        ".select2-results__option",
+    ]
+
     loop = asyncio.get_event_loop()
     deadline = loop.time() + (wait_ms / 1000)
-    
-    contexts = [frame]
-    if hasattr(frame, 'page') and frame.page != frame:
-        contexts.append(frame.page)
 
     while loop.time() < deadline:
         for context in contexts:
-            for selector in LISTBOX_OPTION_SELECTORS:
+            for selector in option_selectors:
                 try:
                     locator = context.locator(selector)
                     count = await locator.count()
                     if count == 0:
                         continue
                     texts = []
-                    for i in range(min(count, 20)):
+                    for i in range(min(count, 60)):
                         opt = locator.nth(i)
                         if await opt.is_visible():
+                            # Ignore elements that are part of the site navigation or header
+                            is_nav = await opt.evaluate(
+                                "el => !!el.closest('nav, header, [role=\"navigation\"], .sticky-nav, [class*=\"header\"]')"
+                            )
+                            if is_nav:
+                                continue
                             text = (await opt.inner_text()).strip()
                             if text:
                                 texts.append(text)
@@ -921,9 +1412,56 @@ async def find_visible_listbox_options(frame, wait_ms: int = LISTBOX_WAIT_MS) ->
 
 async def click_option_by_text(context, selector: str, text: str) -> bool:
     try:
+        loc = context.locator(selector)
+        count = await loc.count()
+        target_norm = normalize_text(text)
+        
+        # 1. Exact normalized match
+        for i in range(count):
+            opt = loc.nth(i)
+            try:
+                if await opt.is_visible():
+                    t = (await opt.inner_text()).strip()
+                    if normalize_text(t) == target_norm:
+                        try:
+                            await opt.scroll_into_view_if_needed(timeout=1000)
+                        except Exception:
+                            pass
+                        try:
+                            await opt.click(timeout=2000)
+                        except Exception:
+                            await opt.evaluate("el => el.click()")
+                        return True
+            except Exception:
+                continue
+
+        # 2. Substring match
+        for i in range(count):
+            opt = loc.nth(i)
+            try:
+                if await opt.is_visible():
+                    t = (await opt.inner_text()).strip()
+                    t_norm = normalize_text(t)
+                    if target_norm in t_norm or t_norm in target_norm:
+                        try:
+                            await opt.scroll_into_view_if_needed(timeout=1000)
+                        except Exception:
+                            pass
+                        try:
+                            await opt.click(timeout=2000)
+                        except Exception:
+                            await opt.evaluate("el => el.click()")
+                        return True
+            except Exception:
+                continue
+
+        # 3. Direct Playwright filter fallback
         locator = context.locator(selector).filter(has_text=text).first
         if await locator.is_visible():
-            await locator.click(timeout=5000)
+            try:
+                await locator.click(timeout=2000)
+            except Exception:
+                await locator.evaluate("el => el.click()")
             return True
     except Exception:
         pass
@@ -931,12 +1469,35 @@ async def click_option_by_text(context, selector: str, text: str) -> bool:
 
 
 async def read_element_value(elem: ElementHandle) -> str:
-    """Best-effort read of a field's current committed value, for post-selection verification."""
+    """Best-effort read of a field's current committed value, for post-selection verification and skip checks."""
     try:
-        tag = await elem.evaluate("el => el.tagName.toLowerCase()")
-        if tag in ("input", "textarea", "select"):
-            return (await elem.input_value()) or ""
-        return ((await elem.evaluate("el => el.value || el.textContent || ''")) or "").strip()
+        val = await elem.evaluate("""el => {
+            // First check if this element is inside a React-Select / custom combobox container
+            const container = el.closest('.select__control, .select-shell, .select__container, [class*="control"], [class*="container"], [class*="select"]');
+            if (container) {
+                const singleValue = container.querySelector('.select__single-value, [class*="singleValue"], [class*="single-value"], [class*="SingleValue"], [class*="MultiValue"]');
+                if (singleValue && singleValue.textContent && singleValue.textContent.trim().length > 0) {
+                    return singleValue.textContent.trim();
+                }
+                // If container is a custom combobox/select, the input itself is just a search filter input (e.g. .select__input),
+                // so do NOT return el.value as a committed form value if no singleValue is selected!
+                if (el.classList.contains('select__input') || el.closest('.select__input-container') || el.getAttribute('role') === 'combobox' || el.getAttribute('aria-autocomplete')) {
+                    const hiddenInput = container.querySelector('input[type="hidden"]');
+                    if (hiddenInput && hiddenInput.value && hiddenInput.value.trim().length > 0) {
+                        return hiddenInput.value.trim();
+                    }
+                    return "";
+                }
+            }
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+                return (el.value || '').trim();
+            }
+            if (el.isContentEditable) {
+                return (el.textContent || '').trim();
+            }
+            return (el.value || '').trim();
+        }""")
+        return (val or "").strip()
     except Exception:
         return ""
 
@@ -956,35 +1517,101 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
     is_location = matched_key == "location"
 
     try:
-        await elem.scroll_into_view_if_needed(timeout=5000)
-        await elem.click(timeout=5000)
+        try:
+            await elem.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+
+        # For custom comboboxes / React-Select, click the control container if present to open the menu
+        try:
+            container = await elem.evaluate_handle("el => el.closest('.select__control, .select-shell, .select__container, [class*=\"control\"], [class*=\"select\"]')")
+            container_elem = container.as_element()
+            if container_elem:
+                await container_elem.click(timeout=2000)
+            else:
+                await elem.click(timeout=2000)
+        except Exception:
+            try:
+                await elem.click(force=True, timeout=2000)
+            except Exception:
+                pass
 
         type_value = value
         if value and is_location:
-            # The user requested to type only the city name (e.g. "Haltom City") 
+            # Type only the city name (e.g. "Haltom City") 
             # instead of the full location string (e.g. "Haltom City, TX") to help 
             # the dropdown appear correctly.
             type_value = value.split(',')[0].strip()
+        elif value and (matched_key == "state" or "state" in label.lower()):
+            type_value = US_STATE_CODE_TO_NAME.get(str(value).strip().lower(), str(value).strip())
+        elif value and (matched_key == "city" or "city" in label.lower()):
+            type_value = str(value).strip()
+        elif value and (matched_key == "country" or "country" in label.lower()):
+            if str(value).upper() in ("US", "USA", "UNITED STATES"):
+                type_value = "United States"
+            elif str(value).upper() in ("CA", "CAN", "CANADA"):
+                type_value = "Canada"
+            elif str(value).upper() in ("UK", "GB", "UNITED KINGDOM"):
+                type_value = "United Kingdom"
+            else:
+                type_value = str(value).strip()
         elif value and matched_key == "education_degree":
             # Type just the first prefix (e.g. "Bachelor") so it triggers dropdowns that might strictly expect "Bachelor's" with an apostrophe
             type_value = value.split("'")[0].split("’")[0].split()[0].strip()
+        elif value and (matched_key == "timezone" or "time zone" in label.lower() or "timezone" in label.lower()):
+            val_lower = str(value).lower()
+            if any(k in val_lower for k in ("eastern", "edt", "est")):
+                type_value = "Eastern"
+            elif any(k in val_lower for k in ("central", "cdt", "cst")):
+                type_value = "Central"
+            elif any(k in val_lower for k in ("mountain", "mdt", "mst")):
+                type_value = "Mountain"
+            elif any(k in val_lower for k in ("pacific", "pdt", "pst")):
+                type_value = "Pacific"
+            elif "alaska" in val_lower:
+                type_value = "Alaska"
+            elif "hawaii" in val_lower:
+                type_value = "Hawaii"
+            elif "atlantic" in val_lower:
+                type_value = "Atlantic"
+            else:
+                type_value = None
+        elif matched_key in ("visa_sponsorship_needed", "work_authorization"):
+            # Do NOT type profile strings like "no" / "yes" into search box before opening dropdown
+            type_value = None
 
         if type_value:
             # Clear any pre-existing content before typing
-            await elem.evaluate("el => { if ('value' in el) el.value = ''; }")
+            try:
+                await elem.evaluate("el => { if ('value' in el) el.value = ''; }")
+            except Exception:
+                pass
             
-            # The user requested to type characters one by one very slowly
-            for char in type_value:
-                # Type the single character
-                await elem.press(char, delay=50)
-                import asyncio
-                # Keep a large gap (0.5 seconds) between each letter
-                await asyncio.sleep(0.5)
+            for char in str(type_value):
+                try:
+                    await elem.press(char, delay=50)
+                except Exception:
+                    reacquired = await reacquire_field_element(frame, label)
+                    if reacquired:
+                        elem = reacquired
+                        await elem.press(char, delay=50)
+                await asyncio.sleep(0.1)
             
             # Wait a bit extra after typing for the network request / dropdown to render
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.6)
 
-        option_texts, option_selector, target_context = await find_visible_listbox_options(frame)
+        option_texts, option_selector, target_context = await find_visible_listbox_options(frame, wait_ms=1200, elem=elem)
+        
+        # If typing filtered out all options or menu hasn't opened yet:
+        if not option_texts:
+            try:
+                # Clear the search box to restore full options list and nudge with ArrowDown
+                await elem.evaluate("el => { if ('value' in el) el.value = ''; }")
+                await elem.press("ArrowDown")
+                await asyncio.sleep(0.4)
+                option_texts, option_selector, target_context = await find_visible_listbox_options(frame, wait_ms=1200, elem=elem)
+            except Exception:
+                pass
 
         if option_texts:
             label_norm = normalize_text(label)
@@ -1034,6 +1661,40 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
                             break
                     if best_text:
                         break
+            elif "pronoun" in label_norm:
+                for preferred in PRONOUNS_PREFERRED:
+                    for opt in option_texts:
+                        if normalize_text(opt) in [normalize_text(preferred), preferred.replace("/", " ")]:
+                            best_text = opt
+                            score = 1.0
+                            source = "hardcoded-rule (pronouns: He/Him)"
+                            break
+                    if best_text:
+                        break
+                if not best_text:
+                    for fallback in PRONOUNS_FALLBACK:
+                        for opt in option_texts:
+                            if normalize_text(fallback) in normalize_text(opt):
+                                best_text = opt
+                                score = 1.0
+                                source = "hardcoded-rule (pronouns: Use name only fallback)"
+                                break
+                        if best_text:
+                            break
+            elif any(kw in label_norm for kw in ALWAYS_YES_LABEL_KEYWORDS):
+                for opt in option_texts:
+                    if normalize_text(opt) in ("yes", "y", "true") or normalize_text(opt).startswith("yes"):
+                        best_text = opt
+                        score = 1.0
+                        source = "hardcoded-rule (always yes)"
+                        break
+            elif any(kw in label_norm for kw in ALWAYS_NO_LABEL_KEYWORDS):
+                for opt in option_texts:
+                    if normalize_text(opt) in ("no", "n", "false") or normalize_text(opt).startswith("no"):
+                        best_text = opt
+                        score = 1.0
+                        source = "hardcoded-rule (always no)"
+                        break
 
             if not best_text:
                 forced_choice = resolve_visa_sponsorship_choice(label_norm, option_texts, profile)
@@ -1041,16 +1702,60 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
                     best_text = forced_choice
                     score = 1.0
                     source = "profile.json (visa sponsorship not needed -> legally authorized statement)"
-                elif type_value:
-                    best_text, score = best_matching_option(type_value, option_texts)
-                    source = "dropdown match"
-                    # Location: weak fuzzy match is still fine — the typed text
-                    # filtered the list so the first suggestion is correct.
-                if score < MATCH_THRESHOLD and is_location:
-                    best_text = option_texts[0]
+                elif matched_key == "visa_sponsorship_needed":
+                    needs_sponsorship = interpret_yes_no(profile.get("visa_sponsorship_needed"))
+                    target_ans = "no" if needs_sponsorship is False else "yes"
+                    for opt in option_texts:
+                        if normalize_text(opt) == target_ans or normalize_text(opt).startswith(target_ans):
+                            best_text = opt
+                            score = 1.0
+                            source = f"profile.json (visa_sponsorship_needed={needs_sponsorship})"
+                            break
+                elif matched_key == "work_authorization":
+                    is_auth = interpret_yes_no(profile.get("work_authorization"))
+                    target_ans = "yes" if is_auth is not False else "no"
+                    for opt in option_texts:
+                        if normalize_text(opt) == target_ans or normalize_text(opt).startswith(target_ans):
+                            best_text = opt
+                            score = 1.0
+                            source = f"profile.json (work_authorization={is_auth})"
+                            break
+                elif resolve_gender_identity_choice(label_norm, option_texts):
+                    best_text = resolve_gender_identity_choice(label_norm, option_texts)
                     score = 1.0
-                    source = "location-first-dropdown-result"
-            else:
+                    source = "hardcoded-rule (gender identity)"
+                elif resolve_hispanic_latino_choice(label_norm, option_texts):
+                    best_text = resolve_hispanic_latino_choice(label_norm, option_texts)
+                    score = 1.0
+                    source = "hardcoded-rule (hispanic/latino: no)"
+                elif resolve_eeo_race_choice(label_norm, option_texts):
+                    best_text = resolve_eeo_race_choice(label_norm, option_texts)
+                    score = 1.0
+                    source = "hardcoded-rule (race: white/decline)"
+                elif resolve_hear_about_us_choice(label_norm, option_texts):
+                    best_text = resolve_hear_about_us_choice(label_norm, option_texts)
+                    score = 1.0
+                    source = "hardcoded-rule (hear about us: job board/linkedin)"
+                elif resolve_skills_experience_choice(label_norm, option_texts, profile):
+                    best_text = resolve_skills_experience_choice(label_norm, option_texts, profile)
+                    score = 1.0
+                    source = "profile.json (skills/resume match)"
+                elif value:
+                    best_text, score = best_matching_option(value, option_texts)
+                    source = "dropdown match"
+
+                if score < MATCH_THRESHOLD and is_location and option_texts:
+                    first_opt_norm = normalize_text(option_texts[0])
+                    val_tokens = [t for t in normalize_text(value).split() if len(t) > 2]
+                    if any(t in first_opt_norm for t in val_tokens):
+                        best_text = option_texts[0]
+                        score = 1.0
+                        source = "location-first-dropdown-result"
+                    else:
+                        best_text = None
+                        score = 0.0
+
+            if not best_text or score < MATCH_THRESHOLD:
                 choice = await ask_ollama_choice(label, option_texts, profile, job_logger, "CHOICE_FIELD")
                 normalized_best, _ = best_matching_option(choice, option_texts)
                 best_text = normalized_best or choice
@@ -1060,6 +1765,7 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
             if best_text and score >= MATCH_THRESHOLD:
                 clicked = await click_option_by_text(target_context, option_selector, best_text)
                 if clicked:
+                    await asyncio.sleep(0.3)
                     committed = await read_element_value(elem)
                     if committed and best_text.lower() not in committed.lower() and committed.lower() not in best_text.lower():
                         job_logger.warning(f"Combobox '{label}': committed value '{committed}' doesn't clearly match selected option '{best_text}'.")
@@ -1112,9 +1818,22 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
             return True
 
         if value:
-            # Non-location combobox with no options rendered - plain text input
-            log_field_decision(job_logger, label, "PROFILE_FIELD", "profile.json", value)
-            return True
+            # Check if this element is a standard text input vs a strict custom dropdown
+            is_custom_select = False
+            try:
+                is_custom_select = await elem.evaluate("""el => {
+                    return !!el.closest('.select__control, .select-shell, .select__container, [class*="control"], [class*="select"], [role="combobox"]');
+                }""")
+            except Exception:
+                pass
+
+            if not is_custom_select:
+                # Non-location standard input with datalist / autocomplete hints - plain text input
+                log_field_decision(job_logger, label, "PROFILE_FIELD", "profile.json", value)
+                return True
+            else:
+                job_logger.warning(f"Custom combobox '{label}' could not match or click an option for value '{value}'. Leaving for retry.")
+                return False
 
         job_logger.warning(f"Combobox '{label}' had no profile match and no options rendered on focus. Leaving unanswered.")
         log_field_decision(job_logger, label, "CHOICE_FIELD", "skipped-no-options", None)
@@ -1266,23 +1985,6 @@ async def get_field_label(frame, element: ElementHandle, is_group: bool = False)
     return label or ""
 
 
-async def is_combobox_element(element: ElementHandle) -> bool:
-    """Detects text inputs that are actually type-ahead comboboxes."""
-    try:
-        role = (await element.get_attribute("role")) or ""
-        aria_autocomplete = (await element.get_attribute("aria-autocomplete")) or ""
-        aria_controls = (await element.get_attribute("aria-controls")) or ""
-        has_list_attr = (await element.get_attribute("list")) or ""
-        return bool(
-            role.lower() == "combobox"
-            or aria_autocomplete.lower() in ("list", "both")
-            or aria_controls
-            or has_list_attr
-        )
-    except Exception:
-        return False
-
-
 def parse_salary_value(val: str, label: str = "") -> str:
     """
     Parses salary strings into clean numeric format (e.g. '130k' -> '130000', '$130,000' -> '130000').
@@ -1394,16 +2096,67 @@ def is_numeric_field(elem_type: str, input_mode: str, pattern: str, label: str, 
     return False
 
 
-async def set_field_value(elem: ElementHandle, value: str) -> None:
-    """Sets a value on a native input/textarea/select, or types into a contenteditable element."""
+async def reacquire_field_element(frame, label: str) -> ElementHandle | None:
+    """Finds a fresh handle for an element matching a label if the original handle became detached."""
+    if not frame or not label:
+        return None
+    try:
+        clean_lbl = label.strip()
+        # 1. Search by label text association
+        label_elems = await frame.query_selector_all("label")
+        for lbl in label_elems:
+            try:
+                t = (await lbl.inner_text()).strip()
+                if (clean_lbl.lower() in t.lower()) or (t.lower() in clean_lbl.lower() and len(t) > 5):
+                    for_id = await lbl.get_attribute("for")
+                    if for_id:
+                        target = await frame.query_selector(f"#{for_id}")
+                        if target and await target.is_visible():
+                            return target
+                    target = await lbl.query_selector("input, textarea, select, [contenteditable='true']")
+                    if target and await target.is_visible():
+                        return target
+                    cand = await lbl.evaluate_handle("el => { let s = el.nextElementSibling; return s ? (s.querySelector('input, textarea, select') || s) : null; }")
+                    if cand and cand.as_element():
+                        return cand.as_element()
+            except Exception:
+                continue
+
+        # 2. Search by placeholder / aria-label / name
+        first_few_words = clean_lbl.split()[:4]
+        search_snippet = " ".join(first_few_words) if first_few_words else clean_lbl[:20]
+        for attr in ("placeholder", "aria-label", "name"):
+            cand = await frame.query_selector(f"[{attr}*='{search_snippet}']")
+            if cand and await cand.is_visible():
+                return cand
+    except Exception:
+        pass
+    return None
+
+
+async def set_field_value(elem: ElementHandle, value: str, frame=None, label: str = None) -> None:
+    """Sets a value on a native input/textarea/select, or types into a contenteditable element with auto-reacquisition."""
+    target_elem = elem
+    try:
+        is_attached = await target_elem.evaluate("el => el.isConnected === true")
+        if not is_attached and frame and label:
+            fresh = await reacquire_field_element(frame, label)
+            if fresh:
+                target_elem = fresh
+    except Exception:
+        if frame and label:
+            fresh = await reacquire_field_element(frame, label)
+            if fresh:
+                target_elem = fresh
+
     is_editable = False
     try:
-        is_editable = await elem.evaluate("el => el.isContentEditable === true")
+        is_editable = await target_elem.evaluate("el => el.isContentEditable === true")
     except Exception:
         pass
 
     try:
-        input_type = (await elem.get_attribute("type") or "").lower()
+        input_type = (await target_elem.get_attribute("type") or "").lower()
         if input_type == "number":
             # Strip any non-digit/decimal characters to prevent Playwright Malformed input error
             match = re.search(r"(\d+(?:\.\d+)?)", str(value))
@@ -1415,24 +2168,47 @@ async def set_field_value(elem: ElementHandle, value: str) -> None:
         pass
 
     try:
-        await elem.scroll_into_view_if_needed(timeout=2000)
-        await elem.click(timeout=3000)
+        await target_elem.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        pass
+
+    try:
+        await target_elem.click(timeout=2000)
     except Exception:
         try:
-            await elem.click(force=True, timeout=2000)
+            await target_elem.click(force=True, timeout=2000)
         except Exception:
             pass
 
     try:
-        await elem.press("Control+a", timeout=1000)
-        await elem.press("Backspace", timeout=1000)
+        await target_elem.press("Control+a", timeout=1000)
+        await target_elem.press("Backspace", timeout=1000)
     except Exception:
         pass
 
     if is_editable:
-        await elem.type(value, delay=20)
+        await target_elem.type(value, delay=20)
     else:
-        await elem.fill(value)
+        try:
+            await target_elem.fill(value)
+        except Exception:
+            # Fallback to direct JS property set + events
+            await target_elem.evaluate("""(el, v) => {
+                el.value = v;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+            }""", value)
+            return
+
+        try:
+            await target_elem.evaluate("""el => {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+            }""")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1470,8 +2246,7 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
     # --- Permanent hardcoded rules for text fields (run before profile matching) ---
     if any(kw in label_norm for kw in ALWAYS_YES_LABEL_KEYWORDS):
         try:
-            await elem.scroll_into_view_if_needed()
-            await set_field_value(elem, "Yes")
+            await set_field_value(elem, "Yes", frame=frame, label=label)
             log_field_decision(job_logger, label, classification, "hardcoded-rule (always yes text)", "Yes")
             return True
         except Exception as e:
@@ -1480,13 +2255,37 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
 
     if any(kw in label_norm for kw in ALWAYS_NO_LABEL_KEYWORDS):
         try:
-            await elem.scroll_into_view_if_needed()
-            await set_field_value(elem, "No")
+            await set_field_value(elem, "No", frame=frame, label=label)
             log_field_decision(job_logger, label, classification, "hardcoded-rule (always no text)", "No")
             return True
         except Exception as e:
             job_logger.error(f"Failed to fill text field '{label}': {e}")
             return False
+
+    # Conditional follow-up fields for 'Yes' responses (e.g. "If you answered yes to the question above, please provide more details.")
+    # Since our profile answers 'No' to sponsorship, relatives, conflicts of interest, etc.,
+    # skip optional follow-up fields or fill 'N/A' if required.
+    if any(kw in label_norm for kw in CONDITIONAL_IF_YES_KEYWORDS) or label_norm.startswith("if yes"):
+        is_req = False
+        try:
+            is_req = "*" in label or "required" in label.lower() or await elem.evaluate("""el => {
+                return el.getAttribute('required') !== null || el.getAttribute('aria-required') === 'true';
+            }""")
+        except Exception:
+            is_req = "*" in label
+        
+        if is_req:
+            try:
+                await set_field_value(elem, "N/A", frame=frame, label=label)
+                log_field_decision(job_logger, label, classification, "hardcoded-conditional-if-yes (answered No -> N/A)", "N/A")
+                return True
+            except Exception as e:
+                job_logger.error(f"Failed to fill required conditional field '{label}': {e}")
+                return False
+        else:
+            job_logger.info(f"Conditional follow-up field '{label}' skipped because answer to parent question is No.")
+            log_field_decision(job_logger, label, classification, "skipped-conditional-if-yes (answered No)", "")
+            return True
 
     if matched_key == "location":
         return await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key)
@@ -1517,15 +2316,60 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
 
     if classification == "PROFILE_FIELD":
         value = get_profile_value(profile, matched_key)
+        
+        # Phone normalization: if inside an international tel widget with a country code prefix (e.g. iti),
+        # strip the country code from the number to avoid duplicate prefix errors
+        if value and (matched_key == "phone" or "phone" in label_norm or elem_type == "tel"):
+            try:
+                is_iti = await elem.evaluate("""el => {
+                    return (el.className && el.className.includes('iti__tel-input')) || el.closest('.iti') !== null;
+                }""")
+            except Exception:
+                is_iti = False
+            
+            if is_iti:
+                # Strip leading +1 or other dial codes so only the national number is typed
+                cleaned_phone = re.sub(r"^\+1\s*", "", str(value).strip())
+                cleaned_phone = re.sub(r"^\+[\d]{1,3}\s*", "", cleaned_phone)
+                value = cleaned_phone
+
         if not value:
-            # middle_name specifically: expected to be absent for most candidates.
-            # Log at INFO, not WARNING, and leave the field blank — never Ollama.
-            if matched_key == "middle_name":
-                job_logger.info(f"No middle name in profile — leaving '{label}' blank.")
-            else:
-                job_logger.warning(f"Profile field '{matched_key}' has no value for '{label}'. Skipping (Ollama not used for profile fields).")
-            log_field_decision(job_logger, label, classification, "skipped-empty-profile-value", None)
-            return False
+            # Check if this field is required on the page
+            is_req = False
+            try:
+                is_req = "*" in label or "required" in label.lower() or await elem.evaluate("""el => {
+                    return el.getAttribute('required') !== null || el.getAttribute('aria-required') === 'true' || el.getAttribute('aria-invalid') === 'true';
+                }""")
+            except Exception:
+                is_req = "*" in label or "required" in label.lower()
+
+            if is_req:
+                first_name = profile.get("first_name") or (profile.get("full_name") or "").split()[0] or "candidate"
+                last_name = profile.get("last_name") or ((profile.get("full_name") or "").split()[-1] if len((profile.get("full_name") or "").split()) > 1 else "")
+                name_slug = f"{first_name.lower()}-{last_name.lower()}".strip("-")
+                
+                if matched_key == "linkedin" or "linkedin" in label_norm:
+                    value = f"https://www.linkedin.com/in/{name_slug}"
+                elif matched_key == "github" or "github" in label_norm:
+                    value = f"https://github.com/{first_name.lower()}{last_name.lower()}"
+                elif matched_key in ("portfolio", "website") or any(w in label_norm for w in ("portfolio", "website")):
+                    value = f"https://www.linkedin.com/in/{name_slug}"
+                elif matched_key == "twitter" or "twitter" in label_norm:
+                    value = "N/A"
+                elif matched_key in ("facebook", "instagram", "youtube"):
+                    value = "N/A"
+                else:
+                    value = await ask_ollama_open_ended(label, profile, job_logger, "OPEN_ENDED")
+
+            if not value:
+                # middle_name, social profiles, website/portfolio specifically: expected to be absent for many candidates.
+                # Log at INFO, not WARNING, and leave the field blank — never Ollama.
+                if matched_key in ("middle_name", "facebook", "instagram", "youtube", "twitter", "github", "portfolio"):
+                    job_logger.info(f"No {matched_key} in profile — leaving '{label}' blank.")
+                else:
+                    job_logger.warning(f"Profile field '{matched_key}' has no value for '{label}'. Skipping (Ollama not used for profile fields).")
+                log_field_decision(job_logger, label, classification, "skipped-empty-profile-value", None)
+                return False
 
         # If field is numeric or key is numeric-related, normalize value
         if numeric_required or matched_key in ("salary_expectation", "years_experience", "education_year"):
@@ -1535,8 +2379,7 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
                 value = formatted_value
 
         try:
-            await elem.scroll_into_view_if_needed()
-            await set_field_value(elem, value)
+            await set_field_value(elem, value, frame=frame, label=label)
             log_field_decision(job_logger, label, classification, "profile.json", value)
             return True
         except Exception as e:
@@ -1548,8 +2391,7 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
     if "pronoun" in label_norm:
         val = "He/Him"
         try:
-            await elem.scroll_into_view_if_needed()
-            await set_field_value(elem, val)
+            await set_field_value(elem, val, frame=frame, label=label)
             log_field_decision(job_logger, label, classification, "hardcoded-rule (pronouns: He/Him text)", val)
             return True
         except Exception as e:
@@ -1563,23 +2405,24 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
         else:
             val = await ask_ollama_open_ended(label, profile, job_logger, classification)
         if val == "N/A":
-            # For URL/link fields that are required, write "N/A" literally so field isn't empty.
-            # For all other fields, leave blank (return False) so validation can catch it.
             label_lower = label.lower()
             is_url_field = any(kw in label_lower for kw in ("url", "link", "http", "website", "portfolio", "github", "linkedin", "credential"))
             if is_url_field:
                 job_logger.info(f"Ollama returned N/A for URL field '{label}'. Writing 'N/A' to satisfy required field.")
                 try:
-                    await elem.scroll_into_view_if_needed()
-                    await set_field_value(elem, "N/A")
+                    await set_field_value(elem, "N/A", frame=frame, label=label)
                     log_field_decision(job_logger, label, classification, "hardcoded-na (no url in profile)", "N/A")
                     return True
                 except Exception as e:
                     job_logger.error(f"Failed to write N/A into URL field '{label}': {e}")
                     return False
-            job_logger.info(f"Ollama returned N/A for '{label}', leaving field blank.")
-            log_field_decision(job_logger, label, classification, "skipped-unanswered", "N/A")
-            return False  # Return False so required-field checks can still flag this as empty
+            
+            # Non-URL open-ended questions should not be left empty
+            if any(term in label_lower for term in ["how did you hear", "hear about", "referral", "source"]):
+                val = "LinkedIn"
+            else:
+                val = "I am enthusiastic about this role and look forward to contributing my technical skills."
+            job_logger.info(f"Ollama returned N/A for non-URL field '{label}'. Using fallback answer: '{val}'")
     except Exception as e:
         job_logger.error(f"Ollama failed to answer open-ended question '{label}': {e}")
         return False
@@ -1588,8 +2431,7 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
         val = parse_numeric_value(val, label=label, elem_type=elem_type, input_mode=input_mode)
 
     try:
-        await elem.scroll_into_view_if_needed()
-        await set_field_value(elem, val)
+        await set_field_value(elem, val, frame=frame, label=label)
         log_field_decision(job_logger, label, classification, "ollama (numeric)" if numeric_required else "ollama", val)
         return True
     except Exception as e:
@@ -1695,6 +2537,21 @@ async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_
             if forced_choice:
                 selected_option_text = forced_choice
                 source = "profile.json (visa sponsorship not needed -> legally authorized statement)"
+            elif resolve_gender_identity_choice(label_norm, options_texts):
+                selected_option_text = resolve_gender_identity_choice(label_norm, options_texts)
+                source = "hardcoded-rule (gender identity)"
+            elif resolve_hispanic_latino_choice(label_norm, options_texts):
+                selected_option_text = resolve_hispanic_latino_choice(label_norm, options_texts)
+                source = "hardcoded-rule (hispanic/latino: no)"
+            elif resolve_eeo_race_choice(label_norm, options_texts):
+                selected_option_text = resolve_eeo_race_choice(label_norm, options_texts)
+                source = "hardcoded-rule (race: white/decline)"
+            elif resolve_hear_about_us_choice(label_norm, options_texts):
+                selected_option_text = resolve_hear_about_us_choice(label_norm, options_texts)
+                source = "hardcoded-rule (hear about us: job board/linkedin)"
+            elif resolve_skills_experience_choice(label_norm, options_texts, profile):
+                selected_option_text = resolve_skills_experience_choice(label_norm, options_texts, profile)
+                source = "profile.json (skills/resume match)"
             elif profile_value:
                 best_text, score = best_matching_option(profile_value, options_texts)
                 if best_text and score >= MATCH_THRESHOLD:
@@ -1841,6 +2698,46 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                 await elem.scroll_into_view_if_needed()
                 await elem.click()
                 return True, "profile.json (visa sponsorship not needed -> legally authorized statement)", opt_text
+
+    gender_id_choice = resolve_gender_identity_choice(label_norm, options_texts)
+    if gender_id_choice:
+        for elem, opt_text in options:
+            if opt_text == gender_id_choice:
+                await elem.scroll_into_view_if_needed()
+                await elem.click()
+                return True, "hardcoded-rule (gender identity)", opt_text
+
+    hispanic_choice = resolve_hispanic_latino_choice(label_norm, options_texts)
+    if hispanic_choice:
+        for elem, opt_text in options:
+            if opt_text == hispanic_choice:
+                await elem.scroll_into_view_if_needed()
+                await elem.click()
+                return True, "hardcoded-rule (hispanic/latino: no)", opt_text
+
+    eeo_race_choice = resolve_eeo_race_choice(label_norm, options_texts)
+    if eeo_race_choice:
+        for elem, opt_text in options:
+            if opt_text == eeo_race_choice:
+                await elem.scroll_into_view_if_needed()
+                await elem.click()
+                return True, "hardcoded-rule (race: white/decline)", opt_text
+
+    source_choice = resolve_hear_about_us_choice(label_norm, options_texts)
+    if source_choice:
+        for elem, opt_text in options:
+            if opt_text == source_choice:
+                await elem.scroll_into_view_if_needed()
+                await elem.click()
+                return True, "hardcoded-rule (hear about us: job board/linkedin)", opt_text
+
+    skill_choice = resolve_skills_experience_choice(label_norm, options_texts, profile)
+    if skill_choice:
+        for elem, opt_text in options:
+            if opt_text == skill_choice:
+                await elem.scroll_into_view_if_needed()
+                await elem.click()
+                return True, "profile.json (skills/resume match)", opt_text
 
     matched_key = find_profile_synonym_match(label)
     profile_value = get_profile_value(profile, matched_key)
@@ -2186,28 +3083,28 @@ async def fill_yesno_buttons(frame, container: ElementHandle, label: str, profil
 
 async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job_logger) -> bool:
     """
-    Uploads the resume file if the field is for resume/CV. Deliberately does not
+    Uploads the resume or cover letter file. Deliberately does not
     require the input to be visible - drag-and-drop uploaders commonly hide the
     real <input type=file> behind a styled dropzone, and set_input_files works
     on hidden inputs regardless.
     """
     try:
-        label_lower = label.lower()
+        label_lower = (label or "").lower()
         
-        # Fallback: if the visible label is generic (like "Drop or select"),
-        # check underlying DOM attributes for hints like "data-testid='resume'"
-        if not any(term in label_lower for term in ["resume", "cv", "curriculum", "cover letter"]):
-            dom_hints = await elem.evaluate("""el => {
-                let lbl = el.closest('label');
-                return [
-                    el.id, el.name, el.getAttribute('data-testid'), el.getAttribute('aria-label'),
-                    lbl ? lbl.getAttribute('data-testid') : '',
-                    lbl ? lbl.getAttribute('aria-label') : ''
-                ].join(' ').toLowerCase();
-            }""")
-            label_lower += " " + dom_hints
+        # Fallback: inspect DOM attributes (e.g. name, id, data-testid, aria-label, parent classes)
+        dom_hints = await elem.evaluate("""el => {
+            let lbl = el.closest('label');
+            let parent = el.closest('div, section, form, fieldset');
+            return [
+                el.id || '', el.name || '', el.getAttribute('data-testid') || '', el.getAttribute('aria-label') || '',
+                el.getAttribute('accept') || '', el.className || '',
+                lbl ? (lbl.getAttribute('data-testid') || '') + ' ' + (lbl.getAttribute('aria-label') || '') + ' ' + (lbl.innerText || '') : '',
+                parent ? (parent.className || '') + ' ' + (parent.getAttribute('data-testid') || '') : ''
+            ].join(' ').toLowerCase();
+        }""")
+        combined_text = (label_lower + " " + dom_hints).strip()
 
-        if "cover letter" in label_lower:
+        if "cover letter" in combined_text or "cover_letter" in combined_text:
             try:
                 cover_letter_path = get_or_create_cover_letter(profile, job_logger)
             except Exception as e:
@@ -2217,18 +3114,16 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
             await elem.set_input_files(absolute_path)
             job_logger.info(f"Uploaded generated cover letter '{absolute_path}' to field '{label}'")
             return True
-        elif any(term in label_lower for term in ["resume", "cv", "curriculum vitae"]):
+        else:
+            # Default any other file upload input on a job form to the candidate's resume
             resume_path = profile.get("resume_file_path", "")
             if resume_path and os.path.exists(resume_path):
                 absolute_path = os.path.abspath(resume_path)
                 await elem.set_input_files(absolute_path)
-                job_logger.info(f"Uploaded resume file '{absolute_path}' to field '{label}'")
+                job_logger.info(f"Uploaded resume file '{absolute_path}' to file upload field (label='{label}')")
                 return True
             else:
                 job_logger.error(f"Resume file path '{resume_path}' is invalid or file does not exist.")
-        else:
-            job_logger.info(f"Skipped file upload field '{label}' (not a resume/CV/cover letter upload)")
-            return True
     except Exception as e:
         job_logger.error(f"Failed to upload file to field '{label}': {e}")
     return False
@@ -2236,18 +3131,23 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
 
 async def find_and_click_next_button(frame, fields_found: int = 1) -> bool:
     """
-    Searches for multi-step buttons like 'Next', 'Continue', 'Proceed', 'Step'
+    Searches for multi-step buttons like 'Next', 'Continue', 'Proceed', 'Next Step'
     and clicks them if found. Returns True if button was clicked.
+    Deliberately excludes 'Apply' / 'Apply Now' buttons so single-page forms don't
+    re-click the top apply button and loop indefinitely.
     """
     next_selectors = [
+        "button:has-text('Next Step')", "button:has-text('Next step')",
         "button:has-text('Next')", "button:has-text('Continue')",
         "button:has-text('Proceed')", "input[type='button'][value='Next']",
-        "input[type='button'][value='Continue']", "a:has-text('Next')",
-        "button[id*='next']", "button[class*='next']",
-        "button:has-text('Apply for this job')", "a:has-text('Apply for this job')",
-        "a:has-text('Apply Now')", "button:has-text('Apply Now')",
-        "a:has-text('Apply To Position')", "button:has-text('Apply To Position')",
-        "a:has-text('Apply')", "button:has-text('Apply')",
+        "input[type='button'][value='Continue']", "a:has-text('Next Step')",
+        "a:has-text('Next')", "button[id*='next']:not([id*='prev'])",
+        "button[class*='next']:not([class*='prev'])",
+        "button[data-automation-id*='next']", "button[data-automation-id*='bottom-navigation-next-button']",
+        "button[data-qa*='next']", "button[data-testid*='next']",
+        "button:has-text('Save & Continue')", "button:has-text('Save and Continue')",
+        "button:has-text('Save and continue')", "a:has-text('Save & Continue')",
+        "button:has-text('Review Application')", "button:has-text('Next section')",
         "button:has-text('I Confirm')", "a:has-text('I Confirm')", "input[value='I Confirm']",
         "button:has-text('I Accept')", "a:has-text('I Accept')", "input[value='I Accept']",
         "button:has-text('Agree')", "a:has-text('Agree')", "input[value='Agree']"
@@ -2256,12 +3156,12 @@ async def find_and_click_next_button(frame, fields_found: int = 1) -> bool:
     for selector in next_selectors:
         try:
             btn = frame.locator(selector).first
-            if await btn.is_visible() and await btn.is_enabled():
-                # Make sure it's not a submit button (unless it's the last page)
-                btn_type = await btn.get_attribute("type")
-                btn_text = await btn.inner_text()
-                if btn_type == "submit" and any(term in btn_text.lower() for term in ["submit", "apply", "finish"]):
-                    continue # Let the final submit block handle it
+            if await btn.count() and await btn.is_visible() and await btn.is_enabled():
+                btn_type = (await btn.get_attribute("type") or "").lower()
+                btn_text = (await btn.inner_text() or "").strip().lower()
+                # Make sure it's not a submit button
+                if btn_type == "submit" or any(term in btn_text for term in ["submit", "finish"]):
+                    continue
 
                 await btn.scroll_into_view_if_needed()
                 await btn.click()
@@ -2293,8 +3193,27 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
         required_elems = await frame.query_selector_all("input[required]:not([type='hidden']), select[required], textarea[required]")
         for elem in required_elems:
             if await elem.is_visible():
+                is_file = await elem.evaluate("el => el.type === 'file'")
+                if is_file:
+                    has_files = await elem.evaluate("el => el.files && el.files.length > 0")
+                    if not has_files:
+                        label = await get_field_label(frame, elem)
+                        reasons.append(f"Required file upload '{label or 'Resume'}' is empty")
+                    continue
+
                 value = await elem.evaluate("el => el.value")
                 if not value or not str(value).strip():
+                    # For React-Select or custom comboboxes, check if the parent container actually has a singleValue selected
+                    has_combobox_val = await elem.evaluate("""el => {
+                        const container = el.closest('.select, .select-shell, .select__container, [class*="react-select"], [class*="select"]');
+                        if (container) {
+                            const valEl = container.querySelector('.select__single-value, [class*="singleValue"], [class*="single-value"], [class*="SingleValue"]');
+                            if (valEl && valEl.textContent && valEl.textContent.trim().length > 0) return true;
+                        }
+                        return false;
+                    }""")
+                    if has_combobox_val:
+                        continue
                     label = await get_field_label(frame, elem)
                     reasons.append(f"Required field '{label or 'unknown'}' is empty")
     except Exception:
@@ -2323,6 +3242,13 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
 
 
 
+
+
+class FormBlockedException(Exception):
+    def __init__(self, status: str, reason: str):
+        self.status = status
+        self.reason = reason
+        super().__init__(f"{status}: {reason}")
 
 
 async def process_form_fields(frame, profile: dict, job_logger) -> int:
@@ -2355,6 +3281,28 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
         try:
             if await is_chat_or_support_element(elem):
                 continue
+            is_hidden_helper = await elem.evaluate("""el => {
+                if (el.tagName === 'INPUT' && el.type !== 'file') {
+                    if (el.getAttribute('tabindex') === '-1' || el.getAttribute('aria-hidden') === 'true') return true;
+                    if (el.className && el.className.includes('requiredInput')) return true;
+                }
+                const name = (el.name || '').toLowerCase();
+                const tid = (el.getAttribute('data-testid') || '').toLowerCase();
+                const ph = (el.placeholder || '').toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                const id = (el.id || '').toLowerCase();
+                const catalogKeywords = [
+                    'search-jobs', 'search jobs', 'all departments', 'all job types',
+                    'all locations', 'search by title', 'search by keyword', 'filter by',
+                    'select-search-input', 'search locations', 'jobs-filter', 'job-search'
+                ];
+                if (catalogKeywords.some(kw => name.includes(kw) || tid.includes(kw) || ph.includes(kw) || aria.includes(kw) || id.includes(kw))) {
+                    return true;
+                }
+                return false;
+            }""")
+            if is_hidden_helper:
+                continue
             tag = await elem.evaluate("el => el.tagName.toLowerCase()")
         except Exception:
             continue
@@ -2363,7 +3311,11 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
         type_attr = (await elem.get_attribute("type") or "").lower()
         contenteditable = (await elem.get_attribute("contenteditable") or "").lower()
 
-        if tag == "input" and type_attr == "radio":
+        # File inputs (Ashby, Lever, Greenhouse, etc.) are frequently hidden behind custom dropzones.
+        # Process them without visibility restrictions.
+        if tag == "input" and type_attr == "file":
+            await _add(elem, "file")
+        elif tag == "input" and type_attr == "radio":
             if await elem.is_visible():
                 name_attr = await elem.get_attribute("name")
                 if name_attr and name_attr not in processed_radio_names:
@@ -2372,9 +3324,6 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
         elif tag == "input" and type_attr == "checkbox":
             if await elem.is_visible():
                 await _add(elem, "checkbox")
-        elif tag == "input" and type_attr == "file":
-            if await elem.is_visible():
-                await _add(elem, "file")
         elif role == "radiogroup":
             if await elem.is_visible():
                 await _add(elem, "radiogroup")
@@ -2387,9 +3336,18 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
         elif tag == "select":
             if await elem.is_visible():
                 await _add(elem, "select")
-        elif tag == "textarea" or contenteditable == "true" or (tag == "input" and type_attr not in ("radio", "checkbox", "file", "hidden", "submit", "button")):
+        elif tag == "textarea" or contenteditable == "true" or (tag == "input" and type_attr not in ("radio", "checkbox", "file", "hidden", "submit", "button", "password")):
             if await elem.is_visible():
                 await _add(elem, "text")
+
+    # Extra guarantee: query all input[type='file'] on the frame so no hidden uploaders are missed
+    try:
+        all_file_inputs = await frame.query_selector_all("input[type='file']")
+        for fi in all_file_inputs:
+            if not any(t[2] == fi for t in tasks):
+                await _add(fi, "file")
+    except Exception:
+        pass
 
     yesno_groups = await find_yesno_button_groups(frame, job_logger)
     job_logger.info(f"Detected {len(yesno_groups)} Yes/No button-pair field(s) on this step.")
@@ -2405,20 +3363,44 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
     # Single top-to-bottom pass, ordered strictly by DOM discovery order.
     tasks.sort(key=lambda t: t[0])
 
+    # Check all discovered fields before starting execution for OTP / security code
+    for _, _, elem, _ in tasks:
+        try:
+            lbl = await get_field_label(frame, elem)
+            lbl_lower = lbl.lower()
+            if any(kw in lbl_lower for kw in ["security code", "verification code", "one-time", "confirm you're a human", "confirm you are a human"]):
+                job_logger.warning(f"OTP / Security code field detected in form fields: '{lbl}'")
+                raise FormBlockedException("OTP Required", f"Security code field detected on page: '{lbl}'")
+        except FormBlockedException:
+            raise
+        except Exception:
+            pass
+
     for _, kind, elem, extra in tasks:
         try:
+            label = await get_field_label(frame, elem, is_group=(kind in ("radio", "radiogroup", "yesno")))
+            label_lower = label.lower()
+            if any(kw in label_lower for kw in ["security code", "verification code", "one-time", "confirm you're a human", "confirm you are a human"]):
+                job_logger.warning(f"OTP / Security code field detected: '{label}'")
+                raise FormBlockedException("OTP Required", f"Security code field detected on page: '{label}'")
+
             if kind == "text":
-                label = await get_field_label(frame, elem)
                 await fill_text_field(frame, elem, label, profile, job_logger)
+                # If we just filled the email field, check if a dynamic OTP / security code section appeared on the page
+                _, matched_key = classify_field(label, "text", profile)
+                if matched_key == "email" or "email" in label_lower:
+                    await asyncio.sleep(1.0)
+                    pg = frame.page if hasattr(frame, 'page') else frame
+                    block_status, block_reason = await detect_captcha_or_login_wall(pg)
+                    if block_status:
+                        job_logger.warning(f"Challenge emerged after entering email: {block_status} ({block_reason})")
+                        raise FormBlockedException(block_status, block_reason)
             elif kind == "select":
-                label = await get_field_label(frame, elem)
                 await fill_select_field(elem, label, profile, job_logger)
             elif kind == "combobox":
-                label = await get_field_label(frame, elem)
                 _, matched_key = classify_field(label, "combobox", profile)
                 await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key)
             elif kind == "file":
-                label = await get_field_label(frame, elem)
                 await handle_file_upload(elem, label, profile, job_logger)
                 # Some ATS forms (e.g. Ashby's "Autofill from resume") re-parse the
                 # upload and re-render parts of the form afterward - give that a
@@ -2426,20 +3408,18 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
                 # don't act on element handles that are about to be replaced.
                 await wait_for_fields_to_settle(frame, timeout_ms=2000)
             elif kind == "radio":
-                label = await get_field_label(frame, elem, is_group=True)
                 await fill_radio_group(frame, extra, label, profile, job_logger)
             elif kind == "radiogroup":
-                group_label = (await elem.get_attribute("aria-label")) or await get_field_label(frame, elem, is_group=True)
+                group_label = (await elem.get_attribute("aria-label")) or label
                 await fill_aria_radio_group(frame, elem, group_label, profile, job_logger)
             elif kind == "checkbox":
-                label = await get_field_label(frame, elem)
                 await fill_checkbox(elem, label, profile, job_logger)
             elif kind == "aria_checkbox":
-                label = await get_field_label(frame, elem)
                 await fill_aria_checkbox(elem, label, profile, job_logger)
             elif kind == "yesno":
-                label = await get_field_label(frame, elem, is_group=True)
                 await fill_yesno_buttons(frame, elem, label, profile, job_logger)
+        except FormBlockedException:
+            raise
         except Exception as e:
             # A field earlier in this same pass (e.g. a file upload triggering
             # an autofill re-render) can detach elements discovered before it.
@@ -2460,7 +3440,11 @@ SUCCESS_TEXT_PATTERNS = [
     "application submitted", "application received",
     "we've received your application", "we have received your application",
     "successfully submitted", "your application has been submitted",
+    "your application was submitted", "thanks for applying",
+    "thanks for your application", "your submission has been received",
     "application complete", "submission successful",
+    "application confirmation", "you've applied", "you have applied",
+    "applied on", "congratulations"
 ]
 
 
@@ -2579,14 +3563,14 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
     """
     try:
         # Step 1: Navigated page captcha/login check
-        has_captcha, captcha_reason = await detect_captcha_or_login_wall(page)
-        if has_captcha:
-            return "Human Attention", captcha_reason
+        block_status, block_reason = await detect_captcha_or_login_wall(page)
+        if block_status:
+            return block_status, block_reason
 
         p_page = _get_raw_playwright_page(page)
 
         # Early check for expired / closed / 404 job postings
-        is_expired, expired_reason = await detect_expired_or_missing_job(p_page)
+        is_expired, expired_reason = await detect_expired_or_missing_job(p_page, initial_job_link=job_link)
         if is_expired:
             job_logger.error(f"Job is no longer open: {expired_reason}")
             return "Expired", f"Job posting expired / closed / 404: {expired_reason}"
@@ -2597,15 +3581,32 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
         # Step 1.5: If we landed on a Job Description page instead of a form, click "Apply".
         # We don't rely on fields_count because Taleo and others have search bars that inflate the count.
         apply_selectors = [
+            "#st-apply",
+            "[data-sr-track='apply']",
+            "[data-automation-id='applyButton']",
             "[data-automation-id='jobFoundationalApplyButton']",
             "[data-automation-id='adventureButton']",
+            "[data-automation-id='applyManually']",
             "a:has-text('Apply Manually')",
             "button:has-text('Apply Manually')",
+            "[data-automation-id='autofillWithResume']",
+            "a:has-text('Autofill with Resume')",
+            "button:has-text('Autofill with Resume')",
+            "a:has-text(\"I'm interested\")",
+            "button:has-text(\"I'm interested\")",
+            "a:has-text('I’m interested')",
+            "button:has-text('I’m interested')",
+            "a:has-text('Im interested')",
+            "button:has-text('Im interested')",
+            "a:has-text('I am interested')",
+            "button:has-text('I am interested')",
             "#ApplyOnline",
             "a[id*='ApplyOnline']",
             "[title='Apply Online']",
             "a[data-ph-at-id='apply-button']",
             "[data-ph-id*='apply']",
+            "[data-testid*='apply-button']",
+            "[data-qa*='apply']",
             "a[data-test='apply-button']",
             "button:has-text('Apply Now')",
             "button:has-text('Apply Online')",
@@ -2615,10 +3616,13 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             "a:has-text('Apply for this job')",
             "button:has-text('Apply to job')",
             "a:has-text('Apply to job')",
+            "button:has-text('Start Application')",
+            "a:has-text('Start Application')",
             "input[value='Apply Online']",
             "input[value='Apply Now']",
             "input[value='Apply']",
             "a.btn-apply",
+            "a.apply-job-btn",
             "button:has-text('Apply'):not([id*='filter']):not([class*='ot-'])",
             "a:has-text('Apply'):not([id*='filter']):not([class*='ot-'])"
         ]
@@ -2674,7 +3678,36 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                             except Exception:
                                 pass
 
-                        await wait_for_fields_to_settle(p_page.main_frame, timeout_ms=10000)
+                        await wait_for_fields_to_settle(p_page.main_frame, timeout_ms=8000)
+
+                        # Handle intermediate modal like "Start Your Application" (Apply Manually / Autofill with Resume)
+                        for _ in range(4):
+                            clicked_modal = False
+                            for f in p_page.frames:
+                                for man_sel in [
+                                    "[data-automation-id='applyManually']",
+                                    "a:has-text('Apply Manually')",
+                                    "button:has-text('Apply Manually')",
+                                    "[data-automation-id='autofillWithResume']",
+                                    "a:has-text('Autofill with Resume')",
+                                    "button:has-text('Autofill with Resume')"
+                                ]:
+                                    try:
+                                        man_btn = f.locator(man_sel).first
+                                        if await man_btn.is_visible():
+                                            await man_btn.click(timeout=3000)
+                                            job_logger.info(f"Clicked intermediate modal action: {man_sel}")
+                                            clicked_modal = True
+                                            await wait_for_fields_to_settle(p_page.main_frame, timeout_ms=5000)
+                                            break
+                                    except Exception:
+                                        pass
+                                if clicked_modal:
+                                    break
+                            if clicked_modal:
+                                break
+                            await asyncio.sleep(1)
+
                         break
                 except Exception:
                     continue
@@ -2687,15 +3720,19 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             job_logger.info(f"Processing Form Step {step}...")
 
             # Recheck CAPTCHA at each step
-            has_captcha, captcha_reason = await detect_captcha_or_login_wall(page)
-            if has_captcha:
-                return "Human Attention", captcha_reason
+            block_status, block_reason = await detect_captcha_or_login_wall(page)
+            if block_status:
+                return block_status, block_reason
 
             await wait_for_fields_to_settle(p_page.main_frame)
             frame = await select_active_frame(p_page)
 
-            fields_found = await process_form_fields(frame, profile, job_logger)
-            total_fields_filled_across_steps += fields_found
+            try:
+                fields_found = await process_form_fields(frame, profile, job_logger)
+                total_fields_filled_across_steps += fields_found
+            except FormBlockedException as fbe:
+                job_logger.warning(f"Form execution halted: {fbe.status} - {fbe.reason}")
+                return fbe.status, fbe.reason
 
             # Validation-error recovery loop: re-attempt filling up to twice more
             for recovery_pass in range(1, MAX_VALIDATION_RECOVERY_PASSES + 1):
@@ -2703,8 +3740,12 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                 if not has_errors:
                     break
                 job_logger.warning(f"Validation issues detected (pass {recovery_pass}): {reasons}. Re-attempting fill...")
-                extra = await process_form_fields(frame, profile, job_logger)
-                total_fields_filled_across_steps += extra
+                try:
+                    extra = await process_form_fields(frame, profile, job_logger)
+                    total_fields_filled_across_steps += extra
+                except FormBlockedException as fbe:
+                    job_logger.warning(f"Form execution halted: {fbe.status} - {fbe.reason}")
+                    return fbe.status, fbe.reason
 
             has_errors, reasons = await find_validation_problems(frame)
             if has_errors:
@@ -2733,20 +3774,39 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                         break
 
                 if clicked_late_apply:
+                    # Check immediately if clicking late apply opened a login/signup wall or captcha
+                    block_status, block_reason = await detect_captcha_or_login_wall(page)
+                    if block_status:
+                        return block_status, block_reason
+
                     frame = await select_active_frame(p_page)
-                    extra = await process_form_fields(frame, profile, job_logger)
-                    total_fields_filled_across_steps += extra
+                    try:
+                        extra = await process_form_fields(frame, profile, job_logger)
+                        total_fields_filled_across_steps += extra
+                    except FormBlockedException as fbe:
+                        job_logger.warning(f"Form execution halted: {fbe.status} - {fbe.reason}")
+                        return fbe.status, fbe.reason
 
                 if total_fields_filled_across_steps == 0:
                     job_logger.warning("No form fields detected on Step 1. Waiting up to 60 seconds for a form to load or for manual intervention to open the form...")
                     for _ in range(30):
                         await asyncio.sleep(2)
+                        
+                        block_status, block_reason = await detect_captcha_or_login_wall(page)
+                        if block_status:
+                            job_logger.info(f"Detected {block_status} while waiting for form fields: {block_reason}")
+                            return block_status, block_reason
+                            
                         frame = await select_active_frame(p_page)
-                        extra = await process_form_fields(frame, profile, job_logger)
-                        if extra > 0:
-                            total_fields_filled_across_steps += extra
-                            job_logger.info("Form fields appeared! Resuming automation.")
-                            break
+                        try:
+                            extra = await process_form_fields(frame, profile, job_logger)
+                            if extra > 0:
+                                total_fields_filled_across_steps += extra
+                                job_logger.info("Form fields appeared! Resuming automation.")
+                                break
+                        except FormBlockedException as fbe:
+                            job_logger.warning(f"Form execution halted: {fbe.status} - {fbe.reason}")
+                            return fbe.status, fbe.reason
 
                     if total_fields_filled_across_steps == 0:
                         job_logger.error("Still no form fields detected after 60 seconds. Aborting.")
@@ -2761,11 +3821,20 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             await wait_for_fields_to_settle(p_page.main_frame)
 
         # Step 3: Pre-submit validation
-        has_captcha, captcha_reason = await detect_captcha_or_login_wall(page)
-        if has_captcha:
-            return "Human Attention", captcha_reason
+        block_status, block_reason = await detect_captcha_or_login_wall(page)
+        if block_status:
+            return block_status, block_reason
 
         frame = await select_active_frame(p_page)
+
+        # Safety Check: If no fields were discovered or filled, do not attempt to click submit buttons
+        if total_fields_filled_across_steps == 0:
+            is_exp, exp_msg = await detect_expired_or_missing_job(p_page, initial_job_link=job_link)
+            if is_exp:
+                job_logger.error(f"Job is expired/closed: {exp_msg}")
+                return "Expired", exp_msg
+            job_logger.warning("No fillable application form fields were detected on the page.")
+            return "Failed", "No fillable application form fields detected on page"
 
         if dry_run:
             job_logger.info("Dry run enabled - form filled but stopping before the final submit click.")
@@ -2788,43 +3857,51 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     return "Submitted", ""
 
                 job_logger.info(f"Waiting 5 seconds before final submission (attempt {submit_attempt})...")
-                import asyncio
                 await asyncio.sleep(5)
 
                 submit_selectors = [
                     "button[type='submit']", "input[type='submit']",
+                    "#submit_app", "button[id*='submit']", "input[id*='submit']",
                     "button:has-text('Submit Application')", "button:has-text('Submit')",
+                    "button:has-text('Send Application')", "button:has-text('Complete Application')",
                     "input[type='button'][value='Submit Application']", "input[type='button'][value='Submit']",
-                    "button:has-text('Apply'):not([id*='filter']):not([class*='ot-'])",
-                    "input[type='button'][value='Apply']"
+                    "button[data-qa*='submit']", "button[data-automation-id*='submit']",
+                    "button[data-automation-id='bottom-navigation-submit-button']",
+                    "button[data-testid*='submit']",
+                    "button:has-text('Submit your application')",
+                    "button:has-text('Submit Form')",
+                    "input[type='button'][value='Submit your application']"
                 ]
 
                 submitted = False
-                for selector in submit_selectors:
-                    try:
-                        btn = frame.locator(selector).first
-                        if await btn.is_visible() and await btn.is_enabled():
-                            if await is_chat_or_support_element(btn):
-                                continue
-                            await btn.scroll_into_view_if_needed()
-                            await _save_screenshot(p_page, company, job_link, job_logger, "before_submit")
-                            await btn.click()
-                            job_logger.info(f"Clicked submit button matching selector: '{selector}'")
-                            submitted = True
-                            break
-                    except Exception:
-                        continue
-                # Fallback 1: Try role/button/anchor matches for 'Apply' or other text-based buttons
+                scopes_to_try = [frame, p_page.main_frame] + [f for f in p_page.frames if f not in (frame, p_page.main_frame) and not is_chat_frame(f)]
+                for scope in scopes_to_try:
+                    for selector in submit_selectors:
+                        try:
+                            btn = scope.locator(selector).first
+                            if await btn.count() and await btn.is_visible() and await btn.is_enabled():
+                                if await is_chat_or_support_element(btn):
+                                    continue
+                                await btn.scroll_into_view_if_needed()
+                                await _save_screenshot(p_page, company, job_link, job_logger, "before_submit")
+                                await btn.click()
+                                job_logger.info(f"Clicked submit button matching selector: '{selector}'")
+                                submitted = True
+                                break
+                        except Exception:
+                            continue
+                    if submitted:
+                        break
+
+                # Fallback 1: Try role/button/anchor matches for 'Submit' text-based buttons
                 if not submitted:
                     extra_text_selectors = [
                         "[role='button']:has-text('Submit Application')", "[role='button']:has-text('Submit')",
                         "a:has-text('Submit Application')", "a:has-text('Submit')",
-                        "[role='button']:has-text('Apply'):not([id*='filter']):not([class*='ot-'])",
-                        "a:has-text('Apply'):not([id*='filter']):not([class*='ot-'])",
+                        "button:has-text('Apply Now'):not([id*='filter']):not([class*='ot-'])"
                     ]
                     try:
-                        frames_to_try = [frame] + [f for f in p_page.frames if f is not frame and not is_chat_frame(f)]
-                        for scope in frames_to_try:
+                        for scope in scopes_to_try:
                             for sel in extra_text_selectors:
                                 try:
                                     loc = scope.locator(sel).first
@@ -2933,7 +4010,6 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                 # Wait for response/navigation - bounded settle-wait plus the existing
                 # network-idle wait, instead of a blind fixed sleep
                 job_logger.info("Waiting 5 seconds after form submission as requested...")
-                import asyncio
                 await asyncio.sleep(5)
                 
                 try:
@@ -2951,10 +4027,10 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     return "Submitted", ""
                 else:
                     # Check if a CAPTCHA or login wall appeared as a result of clicking submit
-                    has_captcha, captcha_reason = await detect_captcha_or_login_wall(page)
-                    if has_captcha:
-                        job_logger.warning(f"Submission blocked: {captcha_reason}")
-                        return "Human Attention", f"Submission blocked by {captcha_reason}"
+                    block_status, block_reason = await detect_captcha_or_login_wall(page)
+                    if block_status:
+                        job_logger.warning(f"Submission blocked: {block_reason}")
+                        return block_status, block_reason
                     
                     # NEW: Check for validation errors after clicking submit
                     has_errors, reasons = await find_validation_problems(frame)

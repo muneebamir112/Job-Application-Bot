@@ -32,7 +32,16 @@ async def dismiss_overlays(page, logger):
         "button:has-text('Got it')",
         "button:has-text('Accept')",
         "a:has-text('Accept')",
-        "a:has-text('I Agree')"
+        "a:has-text('I Agree')",
+        "[aria-label='Close']",
+        "button[aria-label='Close']",
+        "button[aria-label='close']",
+        "[class*='vwo-modal'] [class*='close']",
+        "[id*='vwo-widget'] [class*='close']",
+        "[aria-label='Image dialog box'] [class*='close']",
+        "[aria-label='Image dialog box'] button",
+        ".modal-close",
+        ".popup-close"
     ]
     
     for selector in selectors:
@@ -43,7 +52,6 @@ async def dismiss_overlays(page, logger):
                 if await el.is_visible():
                     logger.info(f"Dismissing overlay using selector: {selector}")
                     await el.click(timeout=3000)
-                    import asyncio
                     await asyncio.sleep(1) # wait a moment for animation to finish
         except Exception:
             pass # ignore errors if elements don't exist or become detached
@@ -101,14 +109,33 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
 
     logger.info(f"Found {len(pending_jobs)} job(s) to process.")
 
-    # Step 3: Launch visible browser via browser-use
+    # Step 3: Launch visible browser via browser-use with auto-recovery
     browser_config = BrowserConfig(
         headless=config.HEADLESS,
         disable_security=True,
         stealth=config.STEALTH_MODE
     )
-    browser = Browser(config=browser_config)
-    
+    browser_holder = {"browser": None}
+
+    async def get_fresh_context():
+        """Creates a fresh browser context with auto-healing if the browser disconnected/crashed."""
+        for attempt in range(2):
+            try:
+                if browser_holder["browser"] is None:
+                    browser_holder["browser"] = Browser(config=browser_config)
+                ctx = await browser_holder["browser"].new_context()
+                return ctx
+            except Exception as b_err:
+                logger.warning(f"Browser connection error ({b_err}), restarting browser instance (attempt {attempt + 1}/2)...")
+                try:
+                    if browser_holder["browser"] is not None:
+                        await browser_holder["browser"].close()
+                except Exception:
+                    pass
+                browser_holder["browser"] = Browser(config=browser_config)
+                if attempt == 1:
+                    return await browser_holder["browser"].new_context()
+
     submitted_count = 0
     failed_count = 0
     human_attention_count = 0
@@ -136,27 +163,40 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                 job_logger.info(f"URL: {link}")
 
                 company_resume_path = os.path.join(config.CVS_DIR, company, f"{profile_name}.pdf")
-                if not os.path.exists(company_resume_path):
+                base_resume_path = os.path.join(config.PROJECT_ROOT, "profiles", f"{profile_name}.pdf")
+                alt_resume_path = os.path.join(config.PROJECT_ROOT, "..", "resume-bot", "profiles", f"{profile_name}.pdf")
+
+                resume_path_to_use = None
+                if os.path.exists(company_resume_path):
+                    resume_path_to_use = company_resume_path
+                    job_logger.info(f"Using tailored resume for '{company}': {company_resume_path}")
+                elif os.path.exists(base_resume_path):
+                    resume_path_to_use = base_resume_path
+                    job_logger.info(f"No tailored resume found for '{company}'. Falling back to base candidate resume: {base_resume_path}")
+                elif os.path.exists(alt_resume_path):
+                    resume_path_to_use = alt_resume_path
+                    job_logger.info(f"No tailored resume found for '{company}'. Falling back to alternate profile resume: {alt_resume_path}")
+                else:
                     job_logger.warning(
-                        f"No tailored resume found for '{company}' at {company_resume_path} "
-                        f"(run Generate Resumes first) - skipping until one exists."
+                        f"No resume found for '{company}' at {company_resume_path} or base profile paths. "
+                        f"Skipping until one exists."
                     )
-                    logger.warning(f"Job {row_idx} skipped for {profile_name}: no tailored resume for '{company}'.")
+                    logger.warning(f"Job {row_idx} skipped for {profile_name}: no resume found.")
                     logger.info(f"Finished job {row_idx} processing for {profile_name}. Log saved to {log_path}")
                     continue
                 
-                profile["resume_file_path"] = company_resume_path
+                profile["resume_file_path"] = resume_path_to_use
                 try:
                     from modules.resume_parser import extract_text_from_pdf
-                    profile["resume_text"] = extract_text_from_pdf(company_resume_path)
+                    profile["resume_text"] = extract_text_from_pdf(resume_path_to_use)
                 except Exception as e:
-                    job_logger.error(f"Failed to extract text from tailored resume: {e}")
+                    job_logger.error(f"Failed to extract text from resume: {e}")
                     
                 profile["job_title"] = title
                 profile["company_name"] = company
 
-                # Create a fresh context and page for each application to avoid browser crashes cascading
-                context = await browser.new_context()
+                # Create a fresh context and page with auto-healing
+                context = await get_fresh_context()
                 try:
                     page = await context.get_current_page()
                     # If page is still None, we might need new_tab() based on the error hint
@@ -174,7 +214,11 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                     elif hasattr(page, '_page'):
                         p_page = page._page
 
-                    await p_page.goto(link, timeout=60000, wait_until="load")
+                    try:
+                        await p_page.goto(link, timeout=45000, wait_until="domcontentloaded")
+                    except Exception as goto_err:
+                        job_logger.warning(f"Navigation wait warning ({goto_err}), proceeding with current page state...")
+
                     await wait_for_fields_to_settle(p_page.main_frame) # Bounded wait for dynamic assets
 
                     # Dismiss cookie banners and overlays before filling form
@@ -190,6 +234,10 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                     elif status == "Human Attention":
                         human_attention_count += 1
                         job_logger.warning(f"Requires Human Attention: {reason}")
+                    elif status in ("Signup Required", "Sign In Required"):
+                        job_logger.warning(f"Sign In Required: {reason}")
+                    elif status == "OTP Required":
+                        job_logger.warning(f"OTP Required: {reason}")
                     elif status == "Dry Run":
                         job_logger.info(f"Dry run complete: {reason}")
                     else:
@@ -213,12 +261,20 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                         sheet.update_profile_status(row_idx, col_idx, "Generated | Failed")
 
                 finally:
-                    await context.close()
+                    if context:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
                     logger.info(f"Finished job {row_idx} processing for {profile_name}. Log saved to {log_path}")
 
     finally:
         # Close browser session cleanly
-        await browser.close()
+        if browser_holder["browser"] is not None:
+            try:
+                await browser_holder["browser"].close()
+            except Exception:
+                pass
 
     # Log overall run summary
     log_run_summary(submitted_count, failed_count, human_attention_count)
