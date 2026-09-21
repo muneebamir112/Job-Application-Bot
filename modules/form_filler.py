@@ -57,6 +57,8 @@ PROFILE_FIELD_SYNONYMS = {
     # special identity field below. The bot leaves it blank if not in profile.
     "middle_name": ["middle name", "middle initial"],
     "last_name": ["last name", "surname", "family name"],
+    # secondary_last_name: secondary/maiden name — intentionally left blank (not in profile)
+    "secondary_last_name": ["secondary last name", "second last name", "second surname", "maiden name", "previous last name", "former last name"],
     "full_name": ["full name", "your name", "candidate name", "applicant name", "legal name", "name", "enter your name", "what is your name"],
     "email": ["email", "e-mail", "email address", "e-mail address"],
     "phone": ["phone", "mobile", "telephone", "phone number", "contact number"],
@@ -217,6 +219,12 @@ def get_profile_value(profile: dict, key: str | None) -> str | None:
     # "My middle name is not provided in the profile."
     if key == "middle_name":
         return profile.get("middle_name") or None
+
+    # --- secondary_last_name: secondary/maiden/former name — intentionally left blank ---
+    # "Secondary Last Name" is a supplemental field on some ATS forms (e.g. SmartRecruiters)
+    # that refers to a maiden name or alias. We never have this in profile and must leave blank.
+    if key == "secondary_last_name":
+        return None
 
     if key == "twitter":
         return profile.get("twitter") or profile.get("Twitter") or profile.get("Twitter(X)") or profile.get("twitter_url") or profile.get("x")
@@ -1326,145 +1334,166 @@ async def is_combobox_element(elem: ElementHandle) -> bool:
 async def find_visible_listbox_options(frame, wait_ms: int = LISTBOX_WAIT_MS, elem: ElementHandle | None = None) -> tuple[list[str], str | None, object]:
     """
     Polls for open listbox options across both the active frame and the top-level
-    page (in case the portal rendered into document.body).
+    page using high-speed in-page DOM evaluation.
     """
     contexts = [frame]
     if hasattr(frame, "page") and frame.page != frame:
         contexts.append(frame.page)
 
-    # First check if the active element has an aria-controls / aria-owns link to a specific listbox
-    if elem:
-        try:
-            target_id = await elem.get_attribute("aria-controls") or await elem.get_attribute("aria-owns")
-            if target_id:
-                for context in contexts:
-                    try:
-                        listbox = context.locator(f"#{target_id}")
-                        if await listbox.count() > 0 and await listbox.first.is_visible():
-                            for sel in ["[role='option']", "li", "div", ".ashby-menu-item"]:
-                                loc = listbox.locator(sel)
-                                count = await loc.count()
-                                if count > 0:
-                                    texts = []
-                                    for i in range(min(count, 60)):
-                                        opt = loc.nth(i)
-                                        if await opt.is_visible():
-                                            t = (await opt.inner_text()).strip()
-                                            if t:
-                                                texts.append(t)
-                                    if texts:
-                                        return texts, f"#{target_id} {sel}", context
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+    deadline = asyncio.get_event_loop().time() + (wait_ms / 1000)
 
-    option_selectors = [
-        "[role='option']",
-        "[role='listbox'] li",
-        "[role='listbox'] div",
-        "ul[class*='select'] li",
-        "ul[class*='dropdown'] li",
-        "ul[class*='menu'] li",
-        "div[class*='option']",
-        "div[class*='Option']",
-        "div[class*='menu'] [class*='option']",
-        "div[class*='select__option']",
-        "div[class*='react-select__option']",
-        "div[class*='-option']",
-        "[id*='react-select'][id*='-option']",
-        ".ashby-menu-item",
-        "[data-automation-id='promptOption']",
-        ".select2-results__option",
-    ]
-
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + (wait_ms / 1000)
-
-    while loop.time() < deadline:
+    while True:
         for context in contexts:
-            for selector in option_selectors:
-                try:
-                    locator = context.locator(selector)
-                    count = await locator.count()
-                    if count == 0:
-                        continue
-                    texts = []
-                    for i in range(min(count, 60)):
-                        opt = locator.nth(i)
-                        if await opt.is_visible():
-                            # Ignore elements that are part of the site navigation or header
-                            is_nav = await opt.evaluate(
-                                "el => !!el.closest('nav, header, [role=\"navigation\"], .sticky-nav, [class*=\"header\"]')"
-                            )
-                            if is_nav:
-                                continue
-                            text = (await opt.inner_text()).strip()
-                            if text:
-                                texts.append(text)
-                    if texts:
-                        return texts, selector, context
-                except Exception:
-                    continue
-        await asyncio.sleep(0.2)
+            try:
+                res = await asyncio.wait_for(context.evaluate("""() => {
+                    // Standard flat selectors
+                    const selectors = [
+                        "[role='option']",
+                        "[role='listbox'] li",
+                        "[role='listbox'] div",
+                        "ul[class*='select'] li",
+                        "ul[class*='dropdown'] li",
+                        "ul[class*='menu'] li",
+                        "div[class*='option']",
+                        "div[class*='Option']",
+                        "div[class*='menu'] [class*='option']",
+                        "div[class*='select__option']",
+                        "div[class*='react-select__option']",
+                        "div[class*='-option']",
+                        "[id*='react-select'][id*='-option']",
+                        ".ashby-menu-item",
+                        "[data-automation-id='promptOption']",
+                        ".select2-results__option"
+                    ];
+                    for (const sel of selectors) {
+                        try {
+                            const els = document.querySelectorAll(sel);
+                            const texts = [];
+                            for (const el of els) {
+                                if (el.offsetWidth > 0 && el.offsetHeight > 0) {
+                                    if (el.closest('nav, header, [role="navigation"], .sticky-nav, [class*="header"]')) continue;
+                                    const txt = (el.innerText || el.textContent || '').trim();
+                                    if (txt) texts.push(txt);
+                                }
+                            }
+                            if (texts.length > 0) return { selector: sel, texts: texts };
+                        } catch(e) {}
+                    }
+                    // Shadow DOM piercing for SmartRecruiters (spl-dropdown-item) and other custom elements
+                    function deepQueryAll(root, selList) {
+                        let results = [];
+                        function visit(r) {
+                            for (const sel of selList) {
+                                try {
+                                    const found = Array.from(r.querySelectorAll(sel)).filter(
+                                        el => el.offsetWidth > 0 && el.offsetHeight > 0
+                                    );
+                                    results = results.concat(found);
+                                } catch(e) {}
+                            }
+                            const children = r.querySelectorAll ? Array.from(r.querySelectorAll('*')) : [];
+                            for (const child of children) {
+                                if (child.shadowRoot) visit(child.shadowRoot);
+                            }
+                        }
+                        visit(root);
+                        return results;
+                    }
+                    const shadowSelectors = [
+                        "spl-dropdown-item",
+                        "[role='option']",
+                        "li[class*='item']",
+                        "li[class*='option']",
+                        "li"
+                    ];
+                    const shadowEls = deepQueryAll(document, shadowSelectors);
+                    const shadowTexts = [];
+                    for (const el of shadowEls) {
+                        if (el.closest && el.closest('nav, header, [role="navigation"], .sticky-nav, [class*="header"]')) continue;
+                        const txt = (el.innerText || el.textContent || '').trim();
+                        if (txt && txt.length > 0 && txt.length < 200) shadowTexts.push(txt);
+                    }
+                    if (shadowTexts.length > 0) return { selector: '__shadow__', texts: [...new Set(shadowTexts)] };
+                    return null;
+                }"""), timeout=0.8)
+                if res and res.get("texts"):
+                    return res["texts"], res["selector"], context
+            except Exception:
+                pass
+
+        if asyncio.get_event_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.1)
+
     return [], None, None
 
 
 async def click_option_by_text(context, selector: str, text: str) -> bool:
+    """Clicks a listbox option matching text with high-speed JS evaluation and shadow DOM fallback."""
+    clean_js = "str => str.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\\s+/g, ' ').trim()"
     try:
-        loc = context.locator(selector)
-        count = await loc.count()
-        target_norm = normalize_text(text)
-        
-        # 1. Exact normalized match
-        for i in range(count):
-            opt = loc.nth(i)
-            try:
-                if await opt.is_visible():
-                    t = (await opt.inner_text()).strip()
-                    if normalize_text(t) == target_norm:
-                        try:
-                            await opt.scroll_into_view_if_needed(timeout=1000)
-                        except Exception:
-                            pass
-                        try:
-                            await opt.click(timeout=2000)
-                        except Exception:
-                            await opt.evaluate("el => el.click()")
-                        return True
-            except Exception:
-                continue
+        res = await asyncio.wait_for(context.evaluate("""({ selector, text }) => {
+            const clean = str => str.toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\\s+/g, ' ').trim();
+            const target = clean(text);
 
-        # 2. Substring match
-        for i in range(count):
-            opt = loc.nth(i)
-            try:
-                if await opt.is_visible():
-                    t = (await opt.inner_text()).strip()
-                    t_norm = normalize_text(t)
-                    if target_norm in t_norm or t_norm in target_norm:
-                        try:
-                            await opt.scroll_into_view_if_needed(timeout=1000)
-                        except Exception:
-                            pass
-                        try:
-                            await opt.click(timeout=2000)
-                        except Exception:
-                            await opt.evaluate("el => el.click()")
-                        return True
-            except Exception:
-                continue
+            // Helper: get all matching elements from flat DOM and shadow DOM
+            function getAllElements(root, sel) {
+                let results = [];
+                if (sel === '__shadow__') {
+                    // Shadow DOM search: collect spl-dropdown-item, [role=option], li
+                    const shadowSels = ['spl-dropdown-item', "[role='option']", 'li[class*=\'item\']', 'li[class*=\'option\']', 'li'];
+                    function visit(r) {
+                        for (const s of shadowSels) {
+                            try { results = results.concat(Array.from(r.querySelectorAll(s))); } catch(e) {}
+                        }
+                        try {
+                            for (const child of Array.from(r.querySelectorAll('*'))) {
+                                if (child.shadowRoot) visit(child.shadowRoot);
+                            }
+                        } catch(e) {}
+                    }
+                    visit(root);
+                } else {
+                    try { results = Array.from(root.querySelectorAll(sel)); } catch(e) {}
+                }
+                return results.filter(el => el.offsetWidth > 0 && el.offsetHeight > 0);
+            }
 
-        # 3. Direct Playwright filter fallback
-        locator = context.locator(selector).filter(has_text=text).first
-        if await locator.is_visible():
-            try:
-                await locator.click(timeout=2000)
-            except Exception:
-                await locator.evaluate("el => el.click()")
+            function tryClick(els) {
+                // 1. Exact match
+                for (const el of els) {
+                    const cur = clean(el.innerText || el.textContent || '');
+                    if (cur === target) { el.scrollIntoView({ block: 'nearest' }); el.click(); return true; }
+                }
+                // 2. Starts with
+                for (const el of els) {
+                    const cur = clean(el.innerText || el.textContent || '');
+                    if (cur.startsWith(target) || target.startsWith(cur)) { el.scrollIntoView({ block: 'nearest' }); el.click(); return true; }
+                }
+                // 3. Substring
+                for (const el of els) {
+                    const cur = clean(el.innerText || el.textContent || '');
+                    if (cur.includes(target) || target.includes(cur)) { el.scrollIntoView({ block: 'nearest' }); el.click(); return true; }
+                }
+                return false;
+            }
+
+            const els = getAllElements(document, selector);
+            return tryClick(els);
+        }""", {"selector": selector, "text": text}), timeout=1.5)
+        if res:
             return True
     except Exception:
         pass
+    try:
+        if selector != '__shadow__':
+            loc = context.locator(selector).filter(has_text=text).first
+            if await loc.is_visible():
+                await loc.click(timeout=1500)
+                return True
+    except Exception:
+        pass
+    return False
     return False
 
 
@@ -1507,14 +1536,40 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
     Universal autocomplete/combobox strategy for any field detected as a
     combobox.
     """
+    # Check if element is still attached to DOM; reacquire if needed (e.g. after resume upload re-render)
+    try:
+        is_attached = await elem.evaluate("el => el.isConnected === true")
+        if not is_attached and frame and label:
+            fresh = await reacquire_field_element(frame, label)
+            if fresh:
+                elem = fresh
+    except Exception:
+        if frame and label:
+            fresh = await reacquire_field_element(frame, label)
+            if fresh:
+                elem = fresh
+
     # Just like text fields, don't re-fill a combobox if it already has a value
     # during validation recovery or multi-step loops where the page didn't advance.
     existing_value = await read_element_value(elem)
     if existing_value and len(existing_value) > 1:
         return True
 
+    # Skip conditional follow-up comboboxes introduced by "If yes, ..." phrasing.
+    # These only apply when a preceding question was answered "Yes" — e.g.
+    # "If yes, please select your most recent employment type" which appears after
+    # "Have you ever worked at AbbVie?". Since the candidate answers "No" to that
+    # question, the follow-up dropdown must be left blank to avoid validation errors.
+    label_lower_skip = label.lower()
+    if label_lower_skip.startswith("if yes") or label_lower_skip.startswith("if so"):
+        job_logger.info(f"Skipping conditional follow-up combobox: '{label}' (precondition was answered No)")
+        log_field_decision(job_logger, label, "CHOICE_FIELD", "skipped-conditional-if-yes", None)
+        return True
+
     value = get_profile_value(profile, matched_key) if matched_key else None
-    is_location = matched_key == "location"
+    if not value and (matched_key in ("country_code", "phone_country_code") or any(kw in label.lower() for kw in ("country code", "phone code", "dialing code"))):
+        value = "United States"
+    is_location = matched_key in ("location", "city") or any(kw in label.lower() for kw in ("location", "city", "where are you based", "residence"))
 
     try:
         try:
@@ -1580,36 +1635,81 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
             # Do NOT type profile strings like "no" / "yes" into search box before opening dropdown
             type_value = None
 
+        if value and is_location:
+            committed = await read_element_value(elem)
+            if committed:
+                ev_norm = normalize_text(committed)
+                val_norm = normalize_text(value)
+                type_val_norm = normalize_text(type_value or "")
+                if (type_val_norm and type_val_norm in ev_norm) or (val_norm and val_norm in ev_norm) or (ev_norm and ev_norm in val_norm):
+                    job_logger.info(f"Location '{label}' already populated with '{committed}' matching profile — skipping re-fill.")
+                    log_field_decision(job_logger, label, "PROFILE_FIELD", "profile.json (pre-filled)", committed)
+                    return True
+
+        target_input = elem
+        try:
+            inner = await elem.evaluate_handle("el => el.shadowRoot ? (el.shadowRoot.querySelector('input, textarea') || el) : el")
+            if inner and inner.as_element():
+                target_input = inner.as_element()
+        except Exception:
+            pass
+
         if type_value:
             # Clear any pre-existing content before typing
             try:
-                await elem.evaluate("el => { if ('value' in el) el.value = ''; }")
+                await target_input.click(timeout=1000)
+                await target_input.press("Control+a", timeout=1000)
+                await target_input.press("Backspace", timeout=1000)
+            except Exception:
+                try:
+                    await target_input.evaluate("el => { if ('value' in el) el.value = ''; }")
+                except Exception:
+                    pass
+            
+            try:
+                await target_input.focus(timeout=1000)
             except Exception:
                 pass
-            
-            for char in str(type_value):
+
+            try:
+                await target_input.type(str(type_value), delay=20, timeout=2500)
+            except Exception:
                 try:
-                    await elem.press(char, delay=50)
+                    await target_input.fill(str(type_value), timeout=2000)
                 except Exception:
-                    reacquired = await reacquire_field_element(frame, label)
-                    if reacquired:
-                        elem = reacquired
-                        await elem.press(char, delay=50)
-                await asyncio.sleep(0.1)
+                    pass
             
             # Wait a bit extra after typing for the network request / dropdown to render
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.4)
+        else:
+            # No type_value — open the dropdown by clicking and then sending ArrowDown.
+            # This is critical for EEO/compliance comboboxes (Gender, Race, Protected Veteran,
+            # Disability) that have no profile value to type, and also for SmartRecruiters'
+            # spl-input components where clicking alone does not render the options list.
+            try:
+                await target_input.click(timeout=1000)
+                await asyncio.sleep(0.2)
+                await target_input.press("ArrowDown", timeout=1000)
+                await asyncio.sleep(0.4)
+            except Exception:
+                try:
+                    await elem.click(force=True, timeout=1000)
+                    await asyncio.sleep(0.2)
+                    await elem.press("ArrowDown", timeout=1000)
+                    await asyncio.sleep(0.4)
+                except Exception:
+                    pass
 
-        option_texts, option_selector, target_context = await find_visible_listbox_options(frame, wait_ms=1200, elem=elem)
+        option_texts, option_selector, target_context = await find_visible_listbox_options(frame, wait_ms=1500, elem=elem)
         
         # If typing filtered out all options or menu hasn't opened yet:
         if not option_texts:
             try:
                 # Clear the search box to restore full options list and nudge with ArrowDown
                 await elem.evaluate("el => { if ('value' in el) el.value = ''; }")
-                await elem.press("ArrowDown")
-                await asyncio.sleep(0.4)
-                option_texts, option_selector, target_context = await find_visible_listbox_options(frame, wait_ms=1200, elem=elem)
+                await elem.press("ArrowDown", timeout=1000)
+                await asyncio.sleep(0.5)
+                option_texts, option_selector, target_context = await find_visible_listbox_options(frame, wait_ms=1500, elem=elem)
             except Exception:
                 pass
 
@@ -1774,12 +1874,9 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
 
         # --- No dropdown appeared on initial load (or click didn't land) ---
         if value and is_location:
-            # Step 4: Keyboard nudge & blind commit — some typeahead widgets (like Google
-            # Places autocomplete) render their dropdowns in detached body elements or
-            # ways that avoid our selectors. But they almost universally respond to
-            # ArrowDown (to highlight the first suggestion) followed by Enter.
+            # Step 4: Keyboard nudge & blind commit
             try:
-                await elem.press("ArrowDown")
+                await elem.press("ArrowDown", timeout=1000)
                 await asyncio.sleep(0.3)
                 
                 # Try to grab a visible option if it appeared this time
@@ -1793,11 +1890,9 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
                 
                 # If still no visible option to click, blindly hit Enter to commit whatever
                 # the ArrowDown highlighted (usually the top autocomplete suggestion).
-                await elem.press("Enter")
+                await elem.press("Enter", timeout=1000)
                 await asyncio.sleep(0.3)
                 committed = await read_element_value(elem)
-                # If the value changed significantly (e.g. "Haltom City" -> "Haltom City, TX"),
-                # the autocomplete was successful.
                 if committed and len(committed) > 3 and committed.lower() != type_value.lower():
                     job_logger.info(f"Location '{label}': blindly committed '{committed}' via ArrowDown+Enter.")
                     log_field_decision(job_logger, label, "PROFILE_FIELD", "location-keyboard-commit", committed)
@@ -1806,15 +1901,26 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
                 pass
 
             # Step 5: Dropdown never appeared and keyboard commit failed — field accepts plain text.
-            committed = await read_element_value(elem)
-            if not committed or committed.lower() == type_value.lower():
-                await elem.evaluate("el => { if ('value' in el) el.value = ''; }")
-                await elem.type(value, delay=30)
+            committed = await read_element_value(target_input)
+            if not committed:
+                try:
+                    await target_input.click(timeout=1000)
+                    await target_input.press("Control+a", timeout=1000)
+                    await target_input.press("Backspace", timeout=1000)
+                except Exception:
+                    pass
+                try:
+                    await target_input.type(value, delay=20, timeout=2000)
+                except Exception:
+                    await target_input.fill(value, timeout=2000)
                 await asyncio.sleep(0.2)
-                await elem.press("Tab") # Help trigger blur validators
+                try:
+                    await target_input.press("Tab", timeout=1000)
+                except Exception:
+                    pass
 
-            job_logger.info(f"Location '{label}': no autocomplete dropdown appeared — keeping typed value '{value}' as plain text.")
-            log_field_decision(job_logger, label, "PROFILE_FIELD", "profile.json (plain-text fallback)", value)
+            job_logger.info(f"Location '{label}': no autocomplete dropdown appeared — keeping typed value '{committed or value}' as plain text.")
+            log_field_decision(job_logger, label, "PROFILE_FIELD", "profile.json (plain-text fallback)", committed or value)
             return True
 
         if value:
@@ -1899,8 +2005,23 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
         label_element = parent_label_handle.as_element()
         if label_element:
             label_text = await label_element.inner_text()
-            if label_text.strip():
+            if label_text.strip() and len(re.sub(r'[*:\s]', '', label_text.strip())) > 0:
                 return label_text.strip()
+
+        # 3. Check custom element host or enclosing form element container (e.g. spl-checkbox, spl-input, spl-form-element, spl-radio-group)
+        host_label = await element.evaluate("""el => {
+            let host = (el.getRootNode && el.getRootNode().host) || el.closest('spl-checkbox, spl-input, spl-form-element, spl-radio-group');
+            if (host) {
+                let lbl = host.getAttribute('label') || host.getAttribute('aria-label') || '';
+                if (lbl && lbl.trim().length > 1) return lbl.trim();
+                let txt = host.innerText || host.textContent || '';
+                let firstLine = txt.trim().split('\\n')[0].trim();
+                if (firstLine && firstLine.replace(/[*:\\s]/g, '').length > 0) return firstLine;
+            }
+            return '';
+        }""")
+        if host_label and host_label.strip() and len(re.sub(r'[*:\s]', '', host_label.strip())) > 0:
+            return host_label.strip()
 
         # 4. Visible text heuristics (nearby <label> or previous text sibling)
         nearby_visible_text = await element.evaluate("""el => {
@@ -1947,7 +2068,7 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
             // Finally, grab the first line of the parent container
             let parent = el.parentElement;
             if (parent) {
-                const lines = parent.innerText.split('\\n').map(l => l.trim()).filter(l => l);
+                const lines = parent.innerText.split('\\n').map(l => l.trim()).filter(l => l.replace(/[*:\\s]/g, '').length > 0);
                 if (lines.length > 0 && lines[0] !== (el.value || '')) {
                     return lines[0];
                 }
@@ -1980,6 +2101,10 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
 async def get_field_label(frame, element: ElementHandle, is_group: bool = False) -> str:
     """Wrapper to retrieve and safely truncate labels to prevent massive DOM text dumps."""
     label = await _get_field_label_raw(frame, element, is_group)
+    if label:
+        clean = re.sub(r'[*:\s]', '', label)
+        if len(clean) == 0:
+            return ""
     if label and len(label) > 200:
         return label[:197] + "..."
     return label or ""
@@ -2138,6 +2263,14 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
     """Sets a value on a native input/textarea/select, or types into a contenteditable element with auto-reacquisition."""
     target_elem = elem
     try:
+        # If target_elem has a shadow root with an internal input or textarea, resolve to that inner input
+        inner = await target_elem.evaluate_handle("el => el.shadowRoot ? (el.shadowRoot.querySelector('input, textarea') || el) : el")
+        if inner and inner.as_element():
+            target_elem = inner.as_element()
+    except Exception:
+        pass
+
+    try:
         is_attached = await target_elem.evaluate("el => el.isConnected === true")
         if not is_attached and frame and label:
             fresh = await reacquire_field_element(frame, label)
@@ -2186,11 +2319,12 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
     except Exception:
         pass
 
-    if is_editable:
-        await target_elem.type(value, delay=20)
-    else:
+    try:
+        # Type character by character with natural typing delay
+        await target_elem.type(str(value), delay=25, timeout=4000)
+    except Exception:
         try:
-            await target_elem.fill(value)
+            await target_elem.fill(str(value), timeout=2000)
         except Exception:
             # Fallback to direct JS property set + events
             await target_elem.evaluate("""(el, v) => {
@@ -2198,17 +2332,21 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
                 el.dispatchEvent(new Event('blur', { bubbles: true }));
-            }""", value)
+            }""", str(value))
             return
 
+    try:
+        await target_elem.evaluate("""el => {
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+        }""")
         try:
-            await target_elem.evaluate("""el => {
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new Event('blur', { bubbles: true }));
-            }""")
+            await target_elem.press("Tab", timeout=1000)
         except Exception:
             pass
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -2230,6 +2368,8 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
             is_invalid = await elem.get_attribute("aria-invalid")
             if is_invalid and is_invalid.lower() == "true":
                 pass  # Field has a value but is marked invalid; fall through to re-fill
+            elif "email" in label.lower() and profile.get("email") and existing_value.strip().lower() != str(profile.get("email")).strip().lower():
+                pass  # Pre-filled email from resume autofill differs from target profile email; overwrite
             else:
                 return True
         except Exception:
@@ -2287,7 +2427,7 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
             log_field_decision(job_logger, label, classification, "skipped-conditional-if-yes (answered No)", "")
             return True
 
-    if matched_key == "location":
+    if matched_key in ("location", "city") or any(kw in label_norm for kw in ("location", "city", "where are you based", "residence")):
         return await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key)
 
     # Inspect element attributes to detect if numeric input is required
@@ -2381,6 +2521,20 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
         try:
             await set_field_value(elem, value, frame=frame, label=label)
             log_field_decision(job_logger, label, classification, "profile.json", value)
+
+            # If this is a confirmation email field, also ensure the main email field has the same value and triggers blur
+            if "confirm" in label_norm and "email" in label_norm:
+                try:
+                    email_inputs = await frame.query_selector_all("input[type='email'], input#email-input, input[name*='email']:not([name*='confirm'])")
+                    for em_el in email_inputs:
+                        em_lbl = (await get_field_label(frame, em_el)).lower()
+                        if "confirm" not in em_lbl and "email" in em_lbl:
+                            curr_v = await read_element_value(em_el)
+                            if not curr_v or curr_v.strip().lower() != str(value).strip().lower():
+                                await set_field_value(em_el, value, frame=frame, label=em_lbl)
+                except Exception:
+                    pass
+
             return True
         except Exception as e:
             job_logger.error(f"Failed to fill text field '{label}': {e}")
@@ -2867,6 +3021,10 @@ async def _resolve_checkbox_state(label: str, profile: dict, job_logger) -> tupl
     if any(kw in label_norm for kw in ALWAYS_YES_LABEL_KEYWORDS):
         return True, "hardcoded-rule (always yes)"
 
+    # Mandatory privacy / policy / declaration / terms checkboxes
+    if any(kw in label_norm for kw in ("privacy notice", "terms and conditions", "terms & conditions", "i agree", "i declare", "acknowledge", "declaration", "consent to", "privacy policy")):
+        return True, "hardcoded-rule (privacy/consent/terms: agree)"
+
     # Always NO rules
     if any(kw in label_norm for kw in ALWAYS_NO_LABEL_KEYWORDS):
         return False, "hardcoded-rule (always no)"
@@ -3081,7 +3239,7 @@ async def fill_yesno_buttons(frame, container: ElementHandle, label: str, profil
     return False
 
 
-async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job_logger) -> bool:
+async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job_logger, resume_already_uploaded: bool = False) -> bool:
     """
     Uploads the resume or cover letter file. Deliberately does not
     require the input to be visible - drag-and-drop uploaders commonly hide the
@@ -3089,6 +3247,14 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
     on hidden inputs regardless.
     """
     try:
+        # If this input already has a file attached, do not re-upload
+        try:
+            has_files = await elem.evaluate("el => el.files && el.files.length > 0")
+            if has_files:
+                return True
+        except Exception:
+            pass
+
         label_lower = (label or "").lower()
         
         # Fallback: inspect DOM attributes (e.g. name, id, data-testid, aria-label, parent classes)
@@ -3115,7 +3281,11 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
             job_logger.info(f"Uploaded generated cover letter '{absolute_path}' to field '{label}'")
             return True
         else:
-            # Default any other file upload input on a job form to the candidate's resume
+            # If resume was already uploaded in this form, do not blindly upload it into secondary attachment dropzones
+            if resume_already_uploaded:
+                job_logger.info(f"Resume already uploaded earlier; skipping additional file upload field (label='{label}')")
+                return True
+
             resume_path = profile.get("resume_file_path", "")
             if resume_path and os.path.exists(resume_path):
                 absolute_path = os.path.abspath(resume_path)
@@ -3137,6 +3307,7 @@ async def find_and_click_next_button(frame, fields_found: int = 1) -> bool:
     re-click the top apply button and loop indefinitely.
     """
     next_selectors = [
+        "spl-button:has-text('Next')", "spl-button:has-text('Continue')", "spl-button:has-text('Proceed')",
         "button:has-text('Next Step')", "button:has-text('Next step')",
         "button:has-text('Next')", "button:has-text('Continue')",
         "button:has-text('Proceed')", "input[type='button'][value='Next']",
@@ -3150,7 +3321,8 @@ async def find_and_click_next_button(frame, fields_found: int = 1) -> bool:
         "button:has-text('Review Application')", "button:has-text('Next section')",
         "button:has-text('I Confirm')", "a:has-text('I Confirm')", "input[value='I Confirm']",
         "button:has-text('I Accept')", "a:has-text('I Accept')", "input[value='I Accept']",
-        "button:has-text('Agree')", "a:has-text('Agree')", "input[value='Agree']"
+        "button:has-text('Agree')", "a:has-text('Agree')", "input[value='Agree']",
+        "[role='button']:has-text('Next')", "[role='button']:has-text('Continue')"
     ]
         
     for selector in next_selectors:
@@ -3223,8 +3395,12 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
         error_elems = await frame.query_selector_all("[class*='error'], [class*='invalid']")
         for elem in error_elems:
             if await elem.is_visible():
-                has_inputs = await elem.evaluate("el => el.querySelector('input, select, textarea, button, a, li, label, [role]') !== null")
-                if not has_inputs:
+                is_form_control_or_host = await elem.evaluate("""el => {
+                    if (el.shadowRoot || el.tagName.includes('-')) return true;
+                    if (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(el.tagName)) return true;
+                    return el.querySelector('input, select, textarea, button, a, li, label, [role]') !== null;
+                }""")
+                if not is_form_control_or_host:
                     text = (await elem.inner_text()).strip()
                     if text and len(text) < 200 and "\n" not in text:
                         reasons.append(f"Visible error message: '{text}'")
@@ -3251,7 +3427,7 @@ class FormBlockedException(Exception):
         super().__init__(f"{status}: {reason}")
 
 
-async def process_form_fields(frame, profile: dict, job_logger) -> int:
+async def process_form_fields(frame, profile: dict, job_logger, resume_already_uploaded: bool = False) -> int:
     """
     Enumerates every field type in the current step and fills them in a single
     pass ordered by on-page vertical position - top to bottom. Using a unified
@@ -3259,13 +3435,21 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
     to their strict DOM order (which matches visual top-to-bottom layout), rather
     than grouping by field type.
     """
-    tasks = []  # (discovery_order, kind, elem, extra)
+    tasks = []  # (discovery_order, kind, elem, extra, initial_id, initial_name)
     order_counter = 0
+    resume_uploaded = resume_already_uploaded
 
     async def _add(elem, kind, extra=None):
         nonlocal order_counter
         order_counter += 1
-        tasks.append((order_counter, kind, elem, extra))
+        elem_id = ""
+        elem_name = ""
+        try:
+            elem_id = (await elem.get_attribute("id") or "").strip()
+            elem_name = (await elem.get_attribute("name") or "").strip()
+        except Exception:
+            pass
+        tasks.append((order_counter, kind, elem, extra, elem_id, elem_name))
 
     giant_selector = (
         "input:not([type='hidden']):not([type='submit']):not([type='button']), "
@@ -3340,11 +3524,22 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
             if await elem.is_visible():
                 await _add(elem, "text")
 
-    # Extra guarantee: query all input[type='file'] on the frame so no hidden uploaders are missed
+    # Extra guarantee: query all input[type='file'] on the frame so no hidden uploaders are missed,
+    # ensuring no duplicates are added if already discovered by giant_selector.
     try:
         all_file_inputs = await frame.query_selector_all("input[type='file']")
         for fi in all_file_inputs:
-            if not any(t[2] == fi for t in tasks):
+            already_added = False
+            for t in tasks:
+                if t[1] == "file":
+                    try:
+                        same = await frame.evaluate("(a, b) => a === b", [t[2], fi])
+                        if same:
+                            already_added = True
+                            break
+                    except Exception:
+                        pass
+            if not already_added:
                 await _add(fi, "file")
     except Exception:
         pass
@@ -3364,7 +3559,7 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
     tasks.sort(key=lambda t: t[0])
 
     # Check all discovered fields before starting execution for OTP / security code
-    for _, _, elem, _ in tasks:
+    for _, _, elem, _, _, _ in tasks:
         try:
             lbl = await get_field_label(frame, elem)
             lbl_lower = lbl.lower()
@@ -3376,9 +3571,30 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
         except Exception:
             pass
 
-    for _, kind, elem, extra in tasks:
+    for _, kind, elem, extra, initial_id, initial_name in tasks:
         try:
+            # Check if elem is still connected, re-acquire if detached by an earlier file upload/render
+            try:
+                is_connected = await elem.evaluate("el => el.isConnected === true")
+            except Exception:
+                is_connected = False
+
+            if not is_connected:
+                fresh = None
+                if initial_id:
+                    fresh = await frame.query_selector(f"#{initial_id}")
+                if not fresh and initial_name:
+                    fresh = await frame.query_selector(f"[name='{initial_name}']")
+                if fresh:
+                    elem = fresh
+
             label = await get_field_label(frame, elem, is_group=(kind in ("radio", "radiogroup", "yesno")))
+            if not is_connected and not label and initial_id:
+                fresh = await frame.query_selector(f"#{initial_id}")
+                if fresh:
+                    elem = fresh
+                    label = await get_field_label(frame, elem, is_group=(kind in ("radio", "radiogroup", "yesno")))
+
             label_lower = label.lower()
             if any(kw in label_lower for kw in ["security code", "verification code", "one-time", "confirm you're a human", "confirm you are a human"]):
                 job_logger.warning(f"OTP / Security code field detected: '{label}'")
@@ -3401,12 +3617,10 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
                 _, matched_key = classify_field(label, "combobox", profile)
                 await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key)
             elif kind == "file":
-                await handle_file_upload(elem, label, profile, job_logger)
-                # Some ATS forms (e.g. Ashby's "Autofill from resume") re-parse the
-                # upload and re-render parts of the form afterward - give that a
-                # moment to settle before touching whatever comes next, so we
-                # don't act on element handles that are about to be replaced.
-                await wait_for_fields_to_settle(frame, timeout_ms=2000)
+                uploaded = await handle_file_upload(elem, label, profile, job_logger, resume_already_uploaded=resume_uploaded)
+                if uploaded and not ("cover letter" in label_lower or "cover_letter" in label_lower):
+                    resume_uploaded = True
+                await wait_for_fields_to_settle(frame, timeout_ms=3000)
             elif kind == "radio":
                 await fill_radio_group(frame, extra, label, profile, job_logger)
             elif kind == "radiogroup":
@@ -3421,11 +3635,6 @@ async def process_form_fields(frame, profile: dict, job_logger) -> int:
         except FormBlockedException:
             raise
         except Exception as e:
-            # A field earlier in this same pass (e.g. a file upload triggering
-            # an autofill re-render) can detach elements discovered before it.
-            # The outer validation-recovery loop in fill_and_submit_form
-            # re-scans the whole form afterward, so skip and move on rather
-            # than aborting the whole pass.
             job_logger.warning(f"Skipping a '{kind}' field mid-pass due to an error (likely a stale element from a re-render earlier in this pass): {e}")
 
     return len(tasks)
@@ -3716,6 +3925,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
         max_steps = 5
         frame = p_page.main_frame
         total_fields_filled_across_steps = 0
+        resume_uploaded_in_form = False
         for step in range(1, max_steps + 1):
             job_logger.info(f"Processing Form Step {step}...")
 
@@ -3728,8 +3938,9 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             frame = await select_active_frame(p_page)
 
             try:
-                fields_found = await process_form_fields(frame, profile, job_logger)
+                fields_found = await process_form_fields(frame, profile, job_logger, resume_already_uploaded=resume_uploaded_in_form)
                 total_fields_filled_across_steps += fields_found
+                resume_uploaded_in_form = True
             except FormBlockedException as fbe:
                 job_logger.warning(f"Form execution halted: {fbe.status} - {fbe.reason}")
                 return fbe.status, fbe.reason
@@ -3741,7 +3952,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     break
                 job_logger.warning(f"Validation issues detected (pass {recovery_pass}): {reasons}. Re-attempting fill...")
                 try:
-                    extra = await process_form_fields(frame, profile, job_logger)
+                    extra = await process_form_fields(frame, profile, job_logger, resume_already_uploaded=resume_uploaded_in_form)
                     total_fields_filled_across_steps += extra
                 except FormBlockedException as fbe:
                     job_logger.warning(f"Form execution halted: {fbe.status} - {fbe.reason}")
@@ -3860,6 +4071,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                 await asyncio.sleep(5)
 
                 submit_selectors = [
+                    "spl-button:has-text('Submit')", "spl-button:has-text('Submit Application')",
                     "button[type='submit']", "input[type='submit']",
                     "#submit_app", "button[id*='submit']", "input[id*='submit']",
                     "button:has-text('Submit Application')", "button:has-text('Submit')",
@@ -3957,7 +4169,11 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     list.push(node);
                 }
             }catch(e){}
-            try{ if(node.shadowRoot) visit(node.shadowRoot.host); }catch(e){}
+            try{
+                if(node.shadowRoot){
+                    for(var s=0; s<node.shadowRoot.children.length; s++) visit(node.shadowRoot.children[s]);
+                }
+            }catch(e){}
             for(var i=0;i<node.children.length;i++) visit(node.children[i]);
         }
         visit(root.documentElement||root);
