@@ -119,22 +119,27 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
 
     async def get_fresh_context():
         """Creates a fresh browser context with auto-healing if the browser disconnected/crashed."""
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 if browser_holder["browser"] is None:
                     browser_holder["browser"] = Browser(config=browser_config)
                 ctx = await browser_holder["browser"].new_context()
+                # Test driver responsiveness by retrieving page
+                test_page = await ctx.get_current_page()
+                if not test_page:
+                    await ctx.new_tab()
                 return ctx
             except Exception as b_err:
-                logger.warning(f"Browser connection error ({b_err}), restarting browser instance (attempt {attempt + 1}/2)...")
+                logger.warning(f"Browser connection error ({b_err}), resetting browser instance (attempt {attempt + 1}/3)...")
                 try:
                     if browser_holder["browser"] is not None:
                         await browser_holder["browser"].close()
                 except Exception:
                     pass
-                browser_holder["browser"] = Browser(config=browser_config)
-                if attempt == 1:
-                    return await browser_holder["browser"].new_context()
+                browser_holder["browser"] = None
+                await asyncio.sleep(1)
+                if attempt == 2:
+                    raise
 
     submitted_count = 0
     failed_count = 0
@@ -265,7 +270,7 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                         try:
                             await context.close()
                         except Exception:
-                            pass
+                            browser_holder["browser"] = None
                     logger.info(f"Finished job {row_idx} processing for {profile_name}. Log saved to {log_path}")
 
     finally:

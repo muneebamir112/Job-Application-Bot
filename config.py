@@ -7,11 +7,10 @@ load_dotenv()
 # Ollama settings
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "35"))
 # Resume parsing and open-ended answers involve much longer prompts/responses
-# than a quick dropdown/checkbox pick, and can take several minutes on slower
-# local hardware - give those a much longer allowance.
-OLLAMA_LONG_TIMEOUT = int(os.getenv("OLLAMA_LONG_TIMEOUT", "600"))
+# than a quick dropdown/checkbox pick - give those a reasonable allowance.
+OLLAMA_LONG_TIMEOUT = int(os.getenv("OLLAMA_LONG_TIMEOUT", "75"))
 
 # Google Sheet settings
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")

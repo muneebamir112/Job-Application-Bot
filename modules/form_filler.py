@@ -45,6 +45,14 @@ SETTLE_TIMEOUT_MS = 3000
 SETTLE_POLL_MS = 300
 MAX_VALIDATION_RECOVERY_PASSES = 2
 
+# Placeholder option texts that indicate a <select> has no real value selected.
+# Used to skip the early-exit in fill_select_field and to filter fallback choices.
+_SELECT_PLACEHOLDER_TEXTS = {
+    "select", "select...", "select one", "select one...", "please select",
+    "please select one", "choose", "choose one", "choose one...", "none",
+    "none selected", "-- select --", "- select -", "---", "--", "-"
+}
+
 GENERIC_FIELD_SELECTOR = (
     "input:not([type='hidden']), textarea, select, "
     "[contenteditable='true'], [role='combobox'], [role='listbox'], "
@@ -687,7 +695,13 @@ ALWAYS_NO_LABEL_KEYWORDS = (
     "former employee",
     "previously employed by",
     "previously worked for",
+    "previously worked at",
     "have you ever worked for",
+    "have you ever worked at",
+    "ever worked for",
+    "ever worked at",
+    "worked at",
+    "worked for",
     "require the support of",
     "maintain that authorization",
     "support to maintain",
@@ -1007,6 +1021,10 @@ Choose the single best matching option. Your response MUST be exactly one of the
         raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT, options={"num_predict": 32})
     except Exception as e:
         job_logger.warning(f"Ollama choice call for '{label}' failed or timed out: {e}. Falling back to default option.")
+        # Return first non-placeholder option, not blindly options[0]
+        for opt in options:
+            if normalize_text(opt) not in _SELECT_PLACEHOLDER_TEXTS:
+                return opt
         return options[0] if options else ""
 
     cleaned = strip_markdown_formatting(raw_answer).strip()
@@ -1027,9 +1045,13 @@ Choose the single best matching option. Your response MUST be exactly one of the
     if best and score >= 0.5:
         return best
 
-    # Ultimate fallback: return first option
-    return options[0] if options else ""
-
+    # Ultimate fallback: try to find a valid option that isn't a placeholder
+    if options:
+        for opt in options:
+            if normalize_text(opt) not in _SELECT_PLACEHOLDER_TEXTS:
+                return opt.strip()
+        return options[0]
+    return ""
 
 async def ask_ollama_numeric(label: str, profile: dict, job_logger) -> str:
     """Prompt Ollama specifically to output a single numeric integer/decimal."""
@@ -1533,7 +1555,7 @@ async def read_element_value(elem: ElementHandle) -> str:
         return ""
 
 
-async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile: dict, job_logger, matched_key: str | None) -> bool:
+async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile: dict, job_logger, matched_key: str | None, field_attempts: dict = None) -> bool:
     """
     Universal autocomplete/combobox strategy for any field detected as a
     combobox.
@@ -1556,6 +1578,13 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
     existing_value = await read_element_value(elem)
     if existing_value and len(existing_value) > 1:
         return True
+
+    if field_attempts is not None and label:
+        lbl_lower = label.lower()
+        field_attempts[lbl_lower] = field_attempts.get(lbl_lower, 0) + 1
+        if field_attempts[lbl_lower] > 3:
+            job_logger.warning(f"Skipping combobox '{label}' - exceeded max fill attempts (3).")
+            return False
 
     # Skip conditional follow-up comboboxes introduced by "If yes, ..." phrasing.
     # These only apply when a preceding question was answered "Yes" — e.g.
@@ -1650,7 +1679,23 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
 
         target_input = elem
         try:
-            inner = await elem.evaluate_handle("el => el.shadowRoot ? (el.shadowRoot.querySelector('input, textarea') || el) : el")
+            inner = await elem.evaluate_handle("""el => {
+                function deepFindInput(root) {
+                    if (!root) return null;
+                    const inp = root.querySelector('input, textarea');
+                    if (inp) return inp;
+                    const children = root.querySelectorAll('*');
+                    for (const ch of children) {
+                        if (ch.shadowRoot) {
+                            const res = deepFindInput(ch.shadowRoot);
+                            if (res) return res;
+                        }
+                    }
+                    return null;
+                }
+                const found = deepFindInput(el.shadowRoot || el);
+                return found || el;
+            }""")
             if inner and inner.as_element():
                 target_input = inner.as_element()
         except Exception:
@@ -1674,10 +1719,14 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
                 pass
 
             try:
-                await target_input.type(str(type_value), delay=20, timeout=2500)
+                await target_input.fill(str(type_value), timeout=2000)
             except Exception:
                 try:
-                    await target_input.fill(str(type_value), timeout=2000)
+                    await target_input.evaluate("""(el, v) => {
+                        el.value = v;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""", str(type_value))
                 except Exception:
                     pass
             
@@ -1963,9 +2012,20 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
     <legend> or an overarching question div) rather than the label of a single option.
     """
     try:
-        # 1. Group-specific logic (for radio groups, yes/no buttons)
+        # 1. Group-specific logic (for radio groups, yes/no buttons, custom web components)
         if is_group:
             group_label = await element.evaluate("""el => {
+                // Check shadowRoot for fieldset > legend or direct legend
+                if (el.shadowRoot) {
+                    let leg = el.shadowRoot.querySelector('legend, [role="heading"], .spl-radio-group__legend, .legend');
+                    if (leg && leg.innerText && leg.innerText.trim()) return leg.innerText.trim();
+                }
+                // Check direct children or light DOM slotted legend / label
+                let internalLeg = el.querySelector('legend, [slot="legend"], [class*="legend"], [class*="question"], [class*="title"], h3, h4, h5, p');
+                if (internalLeg && internalLeg.innerText && internalLeg.innerText.trim()) {
+                    let t = internalLeg.innerText.trim();
+                    if (t.length > 5) return t;
+                }
                 let fieldset = el.closest('fieldset');
                 if (fieldset) {
                     let legend = fieldset.querySelector('legend');
@@ -2010,9 +2070,9 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
             if label_text.strip() and len(re.sub(r'[*:\s]', '', label_text.strip())) > 0:
                 return label_text.strip()
 
-        # 3. Check custom element host or enclosing form element container (e.g. spl-checkbox, spl-input, spl-form-element, spl-radio-group)
+        # 3. Check custom element host or enclosing form element container (e.g. spl-checkbox, spl-input, spl-autocomplete, spl-form-element, spl-radio-group)
         host_label = await element.evaluate("""el => {
-            let host = (el.getRootNode && el.getRootNode().host) || el.closest('spl-checkbox, spl-input, spl-form-element, spl-radio-group');
+            let host = (el.getRootNode && el.getRootNode().host) || el.closest('spl-checkbox, spl-input, spl-autocomplete, spl-form-element, spl-radio-group');
             if (host) {
                 let lbl = host.getAttribute('label') || host.getAttribute('aria-label') || '';
                 if (lbl && lbl.trim().length > 1) return lbl.trim();
@@ -2322,12 +2382,13 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
         pass
 
     try:
-        # Type character by character with natural typing delay
-        await target_elem.type(str(value), delay=25, timeout=4000)
+        # Fast, bulk fill to avoid unnatural typing delays and timeouts
+        if is_editable:
+            await target_elem.evaluate("(el, v) => { el.innerText = v; }", str(value))
+        else:
+            await target_elem.fill(str(value), timeout=2500)
     except Exception:
         try:
-            await target_elem.fill(str(value), timeout=2000)
-        except Exception:
             # Fallback to direct JS property set + events
             await target_elem.evaluate("""(el, v) => {
                 el.value = v;
@@ -2336,6 +2397,8 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
                 el.dispatchEvent(new Event('blur', { bubbles: true }));
             }""", str(value))
             return
+        except Exception:
+            pass
 
     try:
         await target_elem.evaluate("""el => {
@@ -2355,7 +2418,7 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
 # Field fillers
 # ---------------------------------------------------------------------------
 
-async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict, job_logger) -> bool:
+async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
     """Fills a text input, textarea, or contenteditable element."""
     if not label or not label.strip():
         return False
@@ -2376,6 +2439,13 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
                 return True
         except Exception:
             return True
+
+    if field_attempts is not None and label:
+        lbl_lower = label.lower()
+        field_attempts[lbl_lower] = field_attempts.get(lbl_lower, 0) + 1
+        if field_attempts[lbl_lower] > 3:
+            job_logger.warning(f"Skipping text field '{label}' - exceeded max fill attempts (3).")
+            return False
 
     field_type = "combobox" if await is_combobox_element(elem) else "text"
     classification, matched_key = classify_field(label, field_type, profile)
@@ -2595,14 +2665,23 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
         return False
 
 
-async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_logger) -> bool:
+
+async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
     """Fills a native <select> dropdown by choosing an existing option."""
     if not label or not label.strip():
         return False
-    
+
     existing_value = await read_element_value(elem)
-    if existing_value:
+    # Only treat as already-filled if the value is NOT a placeholder text
+    if existing_value and normalize_text(existing_value) not in _SELECT_PLACEHOLDER_TEXTS:
         return True
+
+    if field_attempts is not None and label:
+        lbl_lower = label.lower()
+        field_attempts[lbl_lower] = field_attempts.get(lbl_lower, 0) + 1
+        if field_attempts[lbl_lower] > 3:
+            job_logger.warning(f"Skipping select field '{label}' - exceeded max fill attempts (3).")
+            return False
 
     try:
         await elem.scroll_into_view_if_needed()
@@ -2715,8 +2794,22 @@ async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_
                     source = "dropdown match"
 
         if not selected_option_text:
-            selected_option_text = await ask_ollama_choice(label, options_texts, profile, job_logger, classification)
+            # Strip garbled/control characters from label before sending to Ollama
+            clean_label = re.sub(r'[\x00-\x1f\x7f-\x9f\ufffd\uFFFD]', '', label).strip()
+            selected_option_text = await ask_ollama_choice(clean_label, options_texts, profile, job_logger, classification)
             source = "ollama"
+
+        # If Ollama still returned a placeholder, pick the first real non-placeholder option
+        if not selected_option_text or normalize_text(selected_option_text) in _SELECT_PLACEHOLDER_TEXTS:
+            for opt_txt in options_texts:
+                if normalize_text(opt_txt) not in _SELECT_PLACEHOLDER_TEXTS:
+                    selected_option_text = opt_txt
+                    source = "fallback-first-non-placeholder-option"
+                    break
+
+        if not selected_option_text:
+            job_logger.warning(f"No valid option found for select '{label}' - all options are placeholders. Skipping.")
+            return False
 
         matching_value = None
         final_text = selected_option_text
@@ -2727,9 +2820,16 @@ async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_
                 break
 
         if matching_value is None:
-            matching_value = options_data[0]["value"]
-            final_text = options_data[0]["text"]
-            source = "fallback-first-option"
+            # Never fall back to options_data[0] if it is a placeholder
+            for opt in options_data:
+                if normalize_text(opt["text"]) not in _SELECT_PLACEHOLDER_TEXTS:
+                    matching_value = opt["value"]
+                    final_text = opt["text"]
+                    source = "fallback-first-non-placeholder-option"
+                    break
+            if matching_value is None:
+                job_logger.warning(f"Could not find matching option value for '{label}'. Skipping.")
+                return False
 
         await elem.select_option(value=matching_value)
         log_field_decision(job_logger, label, classification, source, final_text)
@@ -2769,7 +2869,7 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                 await elem.click()
                 return True, f"hardcoded-rule (gender: {GENDER_ANSWER})", opt_text
 
-    if any(kw in label_norm for kw in VETERAN_LABEL_KEYWORDS):
+    if any(kw in label_norm for kw in VETERAN_LABEL_KEYWORDS) or any("protected veteran" in normalize_text(opt) for opt in options_texts):
         for ans_kw in VETERAN_ANSWER_KEYWORDS:
             for elem, opt_text in options:
                 if ans_kw in normalize_text(opt_text):
@@ -2777,7 +2877,7 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                     await elem.click()
                     return True, "hardcoded-rule (veteran: decline)", opt_text
 
-    if any(kw in label_norm for kw in DISABILITY_LABEL_KEYWORDS):
+    if any(kw in label_norm for kw in DISABILITY_LABEL_KEYWORDS) or any("disability" in normalize_text(opt) for opt in options_texts):
         for ans_kw in DISABILITY_ANSWER_KEYWORDS:
             for elem, opt_text in options:
                 if ans_kw in normalize_text(opt_text):
@@ -2920,7 +3020,7 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
     return True, "fallback-first-option", options[0][1]
 
 
-async def fill_radio_group(frame, name_attr: str, label: str, profile: dict, job_logger) -> bool:
+async def fill_radio_group(frame, name_attr: str, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
     """Fills a group of native radio buttons with the same name attribute."""
     try:
         radios = await frame.query_selector_all(f"input[type='radio'][name='{name_attr}']")
@@ -2962,6 +3062,13 @@ async def fill_radio_group(frame, name_attr: str, label: str, profile: dict, job
             if await r.is_checked():
                 return True
 
+        if field_attempts is not None and label:
+            lbl_lower = label.lower()
+            field_attempts[lbl_lower] = field_attempts.get(lbl_lower, 0) + 1
+            if field_attempts[lbl_lower] > 3:
+                job_logger.warning(f"Skipping radio group '{label}' - exceeded max fill attempts (3).")
+                return False
+
         classification, _ = classify_field(label, "radio", profile)
         success, source, final_text = await _resolve_choice_and_click(radio_options, label, profile, job_logger, classification)
         if success:
@@ -2972,15 +3079,34 @@ async def fill_radio_group(frame, name_attr: str, label: str, profile: dict, job
         return False
 
 
-async def fill_aria_radio_group(frame, group_elem: ElementHandle, label: str, profile: dict, job_logger) -> bool:
-    """Fills an ARIA [role=radiogroup] made of [role=radio] children (custom-widget radios)."""
+async def fill_aria_radio_group(frame, group_elem: ElementHandle, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
+    """Fills an ARIA [role=radiogroup] or custom radiogroup component (e.g. spl-radio-group) made of [role=radio] or <spl-radio> children."""
     try:
-        radios = await group_elem.query_selector_all("[role='radio']")
+        # Query both standard [role='radio'] and custom elements like spl-radio
+        radios = await group_elem.query_selector_all("[role='radio'], spl-radio")
+        if not radios:
+            # Try piercing shadow root if children are slotted or inside shadow DOM
+            try:
+                shadow_radios = await group_elem.evaluate_handle("""el => {
+                    const root = el.shadowRoot || el;
+                    return Array.from(root.querySelectorAll('[role="radio"], spl-radio, input[type="radio"]'));
+                }""")
+                radios = await shadow_radios.as_element().query_selector_all("*") if shadow_radios else []
+            except Exception:
+                pass
+
         radio_options = []
         for r in radios:
-            r_label = (await r.get_attribute("aria-label")) or ""
+            r_label = (await r.get_attribute("label")) or (await r.get_attribute("aria-label")) or ""
             if not r_label.strip():
                 r_label = (await r.inner_text()).strip()
+            if not r_label.strip():
+                # Try getting text content or value attribute
+                r_val = (await r.get_attribute("value")) or ""
+                if r_val == "1":
+                    r_label = "Yes"
+                elif r_val == "0":
+                    r_label = "No"
             radio_options.append((r, r_label.strip()))
 
         # Overrides a page's pre-checked default (e.g. "I require assistance
@@ -2991,7 +3117,8 @@ async def fill_aria_radio_group(frame, group_elem: ElementHandle, label: str, pr
         if forced_choice:
             for r, opt_text in radio_options:
                 if opt_text == forced_choice:
-                    if (await r.get_attribute("aria-checked")) == "true":
+                    is_checked = (await r.get_attribute("aria-checked")) == "true" or (await r.get_attribute("checked")) is not None
+                    if is_checked:
                         return True
                     await r.scroll_into_view_if_needed()
                     await r.click()
@@ -3000,8 +3127,16 @@ async def fill_aria_radio_group(frame, group_elem: ElementHandle, label: str, pr
                     return True
 
         for r, _ in radio_options:
-            if (await r.get_attribute("aria-checked")) == "true":
+            is_checked = (await r.get_attribute("aria-checked")) == "true" or (await r.get_attribute("checked")) is not None
+            if is_checked:
                 return True
+
+        if field_attempts is not None and label:
+            lbl_lower = label.lower()
+            field_attempts[lbl_lower] = field_attempts.get(lbl_lower, 0) + 1
+            if field_attempts[lbl_lower] > 3:
+                job_logger.warning(f"Skipping ARIA radio group '{label}' - exceeded max fill attempts (3).")
+                return False
 
         classification, _ = classify_field(label, "radio", profile)
         success, source, final_text = await _resolve_choice_and_click(radio_options, label, profile, job_logger, classification)
@@ -3041,7 +3176,9 @@ async def _resolve_checkbox_state(label: str, profile: dict, job_logger) -> tupl
 
     # Pronouns checkboxes: only check He/Him, uncheck everything else
     pronoun_options = ["he him", "he her", "she her", "they them", "xe xem", "ze zir",
-                       "ze hir", "ey em", "hir hir", "fae faer", "hu hu"]
+                       "ze hir", "ey em", "hir hir", "fae faer", "hu hu", 
+                       "use name only", "custom", "prefer not to say", 
+                       "decline to answer", "decline to self identify"]
     if label_norm in pronoun_options:
         should_check = label_norm in [normalize_text(p) for p in PRONOUNS_PREFERRED]
         return should_check, "hardcoded-rule (pronouns: He/Him only)"
@@ -3076,15 +3213,25 @@ Should the candidate check/agree to this checkbox? (Answer 'yes' or 'no' only):
     return should_check, source
 
 
-async def fill_checkbox(elem: ElementHandle, label: str, profile: dict, job_logger) -> bool:
+async def fill_checkbox(elem: ElementHandle, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
     """Handles a native <input type=checkbox> (e.g. Terms, equal opportunity, relocation, etc.)."""
     try:
         classification, _ = classify_field(label, "checkbox", profile)
         should_check, source = await _resolve_checkbox_state(label, profile, job_logger)
 
+        is_currently_checked = await elem.is_checked()
+        if should_check == is_currently_checked:
+            return True
+
+        if field_attempts is not None and label:
+            lbl_lower = label.lower()
+            field_attempts[lbl_lower] = field_attempts.get(lbl_lower, 0) + 1
+            if field_attempts[lbl_lower] > 3:
+                job_logger.warning(f"Skipping checkbox '{label}' - exceeded max fill attempts (3).")
+                return False
+
         # Pronouns: the rule returns False for all non-He/Him options, so
         # explicitly uncheck them if they were pre-selected.
-        is_currently_checked = await elem.is_checked()
         if should_check and not is_currently_checked:
             await elem.scroll_into_view_if_needed()
             await elem.check()
@@ -3099,13 +3246,34 @@ async def fill_checkbox(elem: ElementHandle, label: str, profile: dict, job_logg
         return False
 
 
-async def fill_aria_checkbox(elem: ElementHandle, label: str, profile: dict, job_logger) -> bool:
+async def fill_aria_checkbox(elem: ElementHandle, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
     """Handles a custom-widget [role=checkbox] element (toggled via click + aria-checked, not .check())."""
     try:
         classification, _ = classify_field(label, "checkbox", profile)
         should_check, source = await _resolve_checkbox_state(label, profile, job_logger)
 
-        current_state = (await elem.get_attribute("aria-checked")) == "true"
+        # Check if the element itself or its shadowRoot / internal input is already checked
+        current_state = await elem.evaluate("""el => {
+            if (el.getAttribute('aria-checked') === 'true' || el.checked === true) return true;
+            if (el.shadowRoot) {
+                const inner = el.shadowRoot.querySelector('input[type="checkbox"], [role="checkbox"]');
+                if (inner && (inner.getAttribute('aria-checked') === 'true' || inner.checked === true)) return true;
+            }
+            const child = el.querySelector('input[type="checkbox"], [role="checkbox"]');
+            if (child && (child.getAttribute('aria-checked') === 'true' || child.checked === true)) return true;
+            return false;
+        }""")
+        
+        if should_check == current_state:
+            return True
+
+        if field_attempts is not None and label:
+            lbl_lower = label.lower()
+            field_attempts[lbl_lower] = field_attempts.get(lbl_lower, 0) + 1
+            if field_attempts[lbl_lower] > 3:
+                job_logger.warning(f"Skipping ARIA checkbox '{label}' - exceeded max fill attempts (3).")
+                return False
+
         if should_check and not current_state:
             await elem.scroll_into_view_if_needed()
             await elem.click()
@@ -3192,7 +3360,7 @@ async def is_yesno_already_answered(container: ElementHandle) -> bool:
         return False
 
 
-async def fill_yesno_buttons(frame, container: ElementHandle, label: str, profile: dict, job_logger, max_attempts: int = 3) -> bool:
+async def fill_yesno_buttons(frame, container: ElementHandle, label: str, profile: dict, job_logger, max_attempts: int = 3, field_attempts: dict = None) -> bool:
     """
     Resolves and clicks the correct button in a Yes/No button-pair question.
     React-based forms can re-render this exact widget shortly after other
@@ -3204,6 +3372,13 @@ async def fill_yesno_buttons(frame, container: ElementHandle, label: str, profil
     """
     if await is_yesno_already_answered(container):
         return True
+
+    if field_attempts is not None and label:
+        lbl_lower = label.lower()
+        field_attempts[lbl_lower] = field_attempts.get(lbl_lower, 0) + 1
+        if field_attempts[lbl_lower] > 3:
+            job_logger.warning(f"Skipping Yes/No buttons '{label}' - exceeded max fill attempts (3).")
+            return False
 
     classification, _ = classify_field(label, "checkbox", profile)
     should_check, source = await _resolve_checkbox_state(label, profile, job_logger)
@@ -3429,7 +3604,7 @@ class FormBlockedException(Exception):
         super().__init__(f"{status}: {reason}")
 
 
-async def process_form_fields(frame, profile: dict, job_logger, resume_already_uploaded: bool = False) -> int:
+async def process_form_fields(frame, profile: dict, job_logger, resume_already_uploaded: bool = False, field_attempts: dict = None) -> int:
     """
     Enumerates every field type in the current step and fills them in a single
     pass ordered by on-page vertical position - top to bottom. Using a unified
@@ -3557,13 +3732,11 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
         except Exception:
             continue
 
-    # SmartRecruiters spl-input combobox discovery:
-    # spl-input is a custom web component used by SmartRecruiters for EEO/compliance
-    # dropdowns (Gender, Race/Ethnicity, Protected Veteran, etc.). It does NOT appear
-    # in the giant_selector because [role='combobox'] is inside its shadow root, not
-    # on the host element. We query spl-input elements directly and add them as comboboxes.
+    # SmartRecruiters custom web components discovery:
+    # spl-input and spl-autocomplete are used for dropdowns/comboboxes (EEO, preliminary questions).
+    # spl-radio-group is used for radio groups (work authorization, visa sponsorship, disability).
+    # These do not expose their internal roles on the outer host element, so giant_selector misses them.
     try:
-        spl_inputs = await frame.query_selector_all("spl-input")
         existing_ids = set()
         for t in tasks:
             try:
@@ -3572,7 +3745,10 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
                     existing_ids.add(eid)
             except Exception:
                 pass
-        for spl_elem in spl_inputs:
+
+        # 1. spl-input & spl-autocomplete as comboboxes
+        spl_combos = await frame.query_selector_all("spl-input, spl-autocomplete")
+        for spl_elem in spl_combos:
             try:
                 if not await spl_elem.is_visible():
                     continue
@@ -3582,7 +3758,27 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
                 if spl_id and spl_id in existing_ids:
                     continue  # already discovered
                 await _add(spl_elem, "combobox")
-                job_logger.debug(f"Discovered SmartRecruiters spl-input combobox: id='{spl_id}'")
+                if spl_id:
+                    existing_ids.add(spl_id)
+                job_logger.debug(f"Discovered SmartRecruiters combobox element: id='{spl_id}'")
+            except Exception:
+                continue
+
+        # 2. spl-radio-group as radiogroup
+        spl_radios = await frame.query_selector_all("spl-radio-group")
+        for spl_rg in spl_radios:
+            try:
+                if not await spl_rg.is_visible():
+                    continue
+                if await is_chat_or_support_element(spl_rg):
+                    continue
+                rg_id = (await spl_rg.get_attribute("id") or "").strip()
+                if rg_id and rg_id in existing_ids:
+                    continue
+                await _add(spl_rg, "radiogroup")
+                if rg_id:
+                    existing_ids.add(rg_id)
+                job_logger.debug(f"Discovered SmartRecruiters spl-radio-group: id='{rg_id}'")
             except Exception:
                 continue
     except Exception:
@@ -3634,7 +3830,7 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
                 raise FormBlockedException("OTP Required", f"Security code field detected on page: '{label}'")
 
             if kind == "text":
-                await fill_text_field(frame, elem, label, profile, job_logger)
+                await fill_text_field(frame, elem, label, profile, job_logger, field_attempts)
                 # If we just filled the email field, check if a dynamic OTP / security code section appeared on the page
                 _, matched_key = classify_field(label, "text", profile)
                 if matched_key == "email" or "email" in label_lower:
@@ -3645,26 +3841,26 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
                         job_logger.warning(f"Challenge emerged after entering email: {block_status} ({block_reason})")
                         raise FormBlockedException(block_status, block_reason)
             elif kind == "select":
-                await fill_select_field(elem, label, profile, job_logger)
+                await fill_select_field(elem, label, profile, job_logger, field_attempts)
             elif kind == "combobox":
                 _, matched_key = classify_field(label, "combobox", profile)
-                await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key)
+                await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key, field_attempts)
             elif kind == "file":
                 uploaded = await handle_file_upload(elem, label, profile, job_logger, resume_already_uploaded=resume_uploaded)
                 if uploaded and not ("cover letter" in label_lower or "cover_letter" in label_lower):
                     resume_uploaded = True
                 await wait_for_fields_to_settle(frame, timeout_ms=3000)
             elif kind == "radio":
-                await fill_radio_group(frame, extra, label, profile, job_logger)
+                await fill_radio_group(frame, extra, label, profile, job_logger, field_attempts)
             elif kind == "radiogroup":
                 group_label = (await elem.get_attribute("aria-label")) or label
-                await fill_aria_radio_group(frame, elem, group_label, profile, job_logger)
+                await fill_aria_radio_group(frame, elem, group_label, profile, job_logger, field_attempts)
             elif kind == "checkbox":
-                await fill_checkbox(elem, label, profile, job_logger)
+                await fill_checkbox(elem, label, profile, job_logger, field_attempts)
             elif kind == "aria_checkbox":
-                await fill_aria_checkbox(elem, label, profile, job_logger)
+                await fill_aria_checkbox(elem, label, profile, job_logger, field_attempts)
             elif kind == "yesno":
-                await fill_yesno_buttons(frame, elem, label, profile, job_logger)
+                await fill_yesno_buttons(frame, elem, label, profile, job_logger, max_attempts=3, field_attempts=field_attempts)
         except FormBlockedException:
             raise
         except Exception as e:
@@ -3803,6 +3999,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
     Returns (status, reason). status is one of "Submitted", "Failed",
     "Human Attention", or "Dry Run" (only when dry_run=True).
     """
+    field_attempts = {}
     try:
         # Step 1: Navigated page captcha/login check
         block_status, block_reason = await detect_captcha_or_login_wall(page)
@@ -3881,33 +4078,65 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     if await btn.is_visible() and await btn.is_enabled():
                         await btn.scroll_into_view_if_needed()
 
-                        # Capture any new tab that the Apply button opens
-                        # (target="_blank" links).  We set up a one-shot popup
-                        # listener BEFORE the click, then switch the bot's page
-                        # reference to the popup if one appears within ~3 s.
+                        # Capture any new tab that the Apply button opens (target="_blank" links).
+                        # We track href, monitor context pages and popup event.
+                        btn_href = None
+                        try:
+                            btn_href = await btn.get_attribute("href")
+                        except Exception:
+                            pass
+
                         _popup_page = None
-                        async def _on_popup(new_page):
+                        def _on_popup(new_page):
                             nonlocal _popup_page
                             _popup_page = new_page
-                        p_page.context.once("page", _on_popup)
+                        p_page.context.on("page", _on_popup)
 
+                        old_pages = set(p_page.context.pages)
                         await btn.click(timeout=3000)
                         job_logger.info(f"Clicked initial 'Apply' button on job description page: {sel}")
                         clicked_initial_apply = True
 
-                        # Wait briefly to see if a popup was spawned
+                        # Wait briefly for popup or navigation to spawn
                         try:
-                            await asyncio.sleep(1.5)
+                            await asyncio.sleep(2.0)
                         except Exception:
                             pass
 
+                        try:
+                            p_page.context.remove_listener("page", _on_popup)
+                        except Exception:
+                            pass
+
+                        # If _popup_page wasn't caught via event, check newly opened pages in context
+                        if _popup_page is None:
+                            new_pages = [p for p in p_page.context.pages if p not in old_pages and not p.is_closed()]
+                            if new_pages:
+                                _popup_page = new_pages[-1]
+
                         if _popup_page is not None:
-                            # A new tab opened — follow it and close the old one
+                            # A new tab opened — ensure it navigates away from about:blank
+                            job_logger.info(f"Apply button opened a new tab: {_popup_page.url}")
+                            if _popup_page.url == "about:blank" or not _popup_page.url.startswith("http"):
+                                try:
+                                    await _popup_page.wait_for_url(lambda u: u != "about:blank" and u.startswith("http"), timeout=6000)
+                                except Exception:
+                                    pass
+
+                            # If it's STILL about:blank and we know the target href, navigate directly
+                            if (_popup_page.url == "about:blank" or not _popup_page.url.startswith("http")) and btn_href and btn_href.startswith("http"):
+                                job_logger.info(f"Tab stuck at about:blank; navigating directly to href: {btn_href}")
+                                try:
+                                    await _popup_page.goto(btn_href, timeout=30000, wait_until="domcontentloaded")
+                                except Exception as ge:
+                                    job_logger.warning(f"Direct navigation to {btn_href} failed: {ge}")
+
                             try:
                                 await _popup_page.wait_for_load_state("domcontentloaded", timeout=10000)
                             except Exception:
                                 pass
-                            job_logger.info(f"Apply button opened a new tab; switching to it: {_popup_page.url}")
+
+                            job_logger.info(f"Switching active page to new tab: {_popup_page.url}")
                             p_page = _popup_page
                             # Replace the wrapped page reference that fill_and_submit_form holds
                             if hasattr(page, '_page'):
@@ -3971,7 +4200,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             frame = await select_active_frame(p_page)
 
             try:
-                fields_found = await process_form_fields(frame, profile, job_logger, resume_already_uploaded=resume_uploaded_in_form)
+                fields_found = await process_form_fields(frame, profile, job_logger, resume_already_uploaded=resume_uploaded_in_form, field_attempts=field_attempts)
                 total_fields_filled_across_steps += fields_found
                 resume_uploaded_in_form = True
             except FormBlockedException as fbe:
@@ -3985,7 +4214,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     break
                 job_logger.warning(f"Validation issues detected (pass {recovery_pass}): {reasons}. Re-attempting fill...")
                 try:
-                    extra = await process_form_fields(frame, profile, job_logger, resume_already_uploaded=resume_uploaded_in_form)
+                    extra = await process_form_fields(frame, profile, job_logger, resume_already_uploaded=resume_uploaded_in_form, field_attempts=field_attempts)
                     total_fields_filled_across_steps += extra
                 except FormBlockedException as fbe:
                     job_logger.warning(f"Form execution halted: {fbe.status} - {fbe.reason}")
@@ -4007,9 +4236,65 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                             btn = f.locator(sel).first
                             if await btn.is_visible() and await btn.is_enabled():
                                 await btn.scroll_into_view_if_needed()
+
+                                late_href = None
+                                try:
+                                    late_href = await btn.get_attribute("href")
+                                except Exception:
+                                    pass
+
+                                _late_popup = None
+                                def _on_late_popup(new_page):
+                                    nonlocal _late_popup
+                                    _late_popup = new_page
+                                p_page.context.on("page", _on_late_popup)
+
+                                old_pages = set(p_page.context.pages)
                                 await btn.click(timeout=3000)
                                 job_logger.info(f"Clicked late 'Apply' button on page: {sel}")
                                 clicked_late_apply = True
+
+                                try:
+                                    await asyncio.sleep(2.0)
+                                except Exception:
+                                    pass
+
+                                try:
+                                    p_page.context.remove_listener("page", _on_late_popup)
+                                except Exception:
+                                    pass
+
+                                if _late_popup is None:
+                                    new_pages = [p for p in p_page.context.pages if p not in old_pages and not p.is_closed()]
+                                    if new_pages:
+                                        _late_popup = new_pages[-1]
+
+                                if _late_popup is not None:
+                                    if _late_popup.url == "about:blank" or not _late_popup.url.startswith("http"):
+                                        try:
+                                            await _late_popup.wait_for_url(lambda u: u != "about:blank" and u.startswith("http"), timeout=6000)
+                                        except Exception:
+                                            pass
+
+                                    if (_late_popup.url == "about:blank" or not _late_popup.url.startswith("http")) and late_href and late_href.startswith("http"):
+                                        job_logger.info(f"Late apply tab stuck at about:blank; navigating directly to href: {late_href}")
+                                        try:
+                                            await _late_popup.goto(late_href, timeout=30000, wait_until="domcontentloaded")
+                                        except Exception as ge:
+                                            job_logger.warning(f"Direct navigation to {late_href} failed: {ge}")
+
+                                    try:
+                                        await _late_popup.wait_for_load_state("domcontentloaded", timeout=10000)
+                                    except Exception:
+                                        pass
+
+                                    job_logger.info(f"Late apply opened tab ({_late_popup.url}); switching to it.")
+                                    p_page = _late_popup
+                                    if hasattr(page, '_page'):
+                                        page._page = _late_popup
+                                    elif hasattr(page, 'page'):
+                                        page.page = _late_popup
+
                                 await wait_for_fields_to_settle(p_page.main_frame, timeout_ms=10000)
                                 break
                         except Exception:
@@ -4023,9 +4308,25 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     if block_status:
                         return block_status, block_reason
 
+                    # Also check if late apply opened a new popup/tab in the browser context
+                    try:
+                        for cp in p_page.context.pages:
+                            if cp != p_page and not cp.is_closed():
+                                cp_count = await count_visible_candidate_fields(cp.main_frame)
+                                if cp_count > 0:
+                                    job_logger.info(f"Late apply opened a new active tab ({cp.url}); switching to it.")
+                                    p_page = cp
+                                    if hasattr(page, '_page'):
+                                        page._page = cp
+                                    elif hasattr(page, 'page'):
+                                        page.page = cp
+                                    break
+                    except Exception:
+                        pass
+
                     frame = await select_active_frame(p_page)
                     try:
-                        extra = await process_form_fields(frame, profile, job_logger)
+                        extra = await process_form_fields(frame, profile, job_logger, field_attempts=field_attempts)
                         total_fields_filled_across_steps += extra
                     except FormBlockedException as fbe:
                         job_logger.warning(f"Form execution halted: {fbe.status} - {fbe.reason}")
@@ -4040,10 +4341,26 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                         if block_status:
                             job_logger.info(f"Detected {block_status} while waiting for form fields: {block_reason}")
                             return block_status, block_reason
+
+                        # Check if a new tab opened during the wait
+                        try:
+                            for cp in p_page.context.pages:
+                                if cp != p_page and not cp.is_closed():
+                                    cp_count = await count_visible_candidate_fields(cp.main_frame)
+                                    if cp_count > 0:
+                                        job_logger.info(f"Detected new tab ({cp.url}) with form fields during wait; switching to it.")
+                                        p_page = cp
+                                        if hasattr(page, '_page'):
+                                            page._page = cp
+                                        elif hasattr(page, 'page'):
+                                            page.page = cp
+                                        break
+                        except Exception:
+                            pass
                             
                         frame = await select_active_frame(p_page)
                         try:
-                            extra = await process_form_fields(frame, profile, job_logger)
+                            extra = await process_form_fields(frame, profile, job_logger, field_attempts=field_attempts)
                             if extra > 0:
                                 total_fields_filled_across_steps += extra
                                 job_logger.info("Form fields appeared! Resuming automation.")
@@ -4285,7 +4602,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     has_errors, reasons = await find_validation_problems(frame)
                     if has_errors:
                         job_logger.warning(f"Validation errors appeared after submit (attempt {submit_attempt}): {reasons}. Attempting to fill missing fields.")
-                        await process_form_fields(frame, profile, job_logger)
+                        await process_form_fields(frame, profile, job_logger, field_attempts=field_attempts)
                         continue  # Loop back and try submitting again
 
                     job_logger.warning("Submit button was clicked but no confirmation (URL change or success message) was detected.")
@@ -4296,6 +4613,9 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             job_logger.info("Auto-submit is disabled. Skipping submission click.")
             return "Submitted", "Auto-submit disabled (manual review mode)"
 
+    except FormBlockedException as fbe:
+        job_logger.warning(f"Form filling blocked: {fbe.status} ({fbe.reason})")
+        return fbe.status, fbe.reason
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
