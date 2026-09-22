@@ -77,7 +77,7 @@ PROFILE_FIELD_SYNONYMS = {
         "legally authorized to work", "authorized to work in the country", "legally authorized to work in the country"
     ],
     "visa_sponsorship_needed": [
-        "visa", "sponsorship", "sponsor", "require visa", "need sponsorship", "require sponsorship",
+        "visa", "sponsorship", "sponsor", "sponorship", "sponor", "require visa", "need sponsorship", "require sponsorship",
         "employment sponsorship", "employment-based visas", "visa sponsorship",
         "require employment sponsorship", "provide employment sponsorship",
         "require the support of", "maintain that authorization", "support to maintain", "maintain authorization"
@@ -198,6 +198,13 @@ def find_profile_synonym_match(label: str) -> str | None:
                 ):
                     continue
                 return key
+
+    # Fallbacks for common placeholders when there are no labels
+    if "example com" in label_norm or "name example" in label_norm or " domain " in label_norm or label_norm.startswith("email "):
+        return "email"
+    if "415 555" in label_norm or "555 1234" in label_norm or "555 5555" in label_norm or "123 456" in label_norm:
+        return "phone"
+
     return None
 
 
@@ -610,7 +617,7 @@ def best_matching_option(value: str, options_texts: list[str]) -> tuple[str | No
 
 
 VISA_SPONSORSHIP_LABEL_KEYWORDS = (
-    "visa", "sponsorship", "sponsor", "support of", "maintain that authorization", "require assistance"
+    "visa", "sponsorship", "sponsor", "sponorship", "sponor", "support of", "maintain that authorization", "require assistance"
 )
 WORK_AUTHORIZATION_STATEMENT_KEYWORDS = ("authorized to work", "legally authorized")
 
@@ -1609,6 +1616,12 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
     # Provide a typeable "No" for Hispanic/Latino comboboxes that require typing to open
     if not value and matched_key is None and any(k in label.lower() for k in ("hispanic", "latino", "ethnicity")):
         value = "No"
+    if not value and matched_key is None and any(k in label.lower() for k in ("gender", "sex")):
+        value = "Male"
+    if not value and matched_key is None and "race" in label.lower():
+        value = "prefer not"
+    if not value and matched_key is None and "veteran" in label.lower():
+        value = "not a protected veteran"
 
     try:
         try:
@@ -2053,6 +2066,11 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
             if group_label:
                 return group_label
 
+        # 1.5. Check direct attributes on the element
+        direct_aria = await element.get_attribute("aria-label")
+        if direct_aria and direct_aria.strip():
+            return direct_aria.strip()
+
         # 2. Check explicit label associations
         elem_id = await element.get_attribute("id")
         if elem_id:
@@ -2061,6 +2079,13 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
                 label_text = await label_elem.inner_text()
                 if label_text.strip():
                     return label_text.strip()
+            # Also try stripping '-input' or similar suffixes
+            if elem_id.endswith('-input'):
+                label_elem2 = await frame.query_selector(f"label[for='{elem_id[:-6]}']")
+                if label_elem2:
+                    label_text2 = await label_elem2.inner_text()
+                    if label_text2.strip():
+                        return label_text2.strip()
 
         labelledby = await element.get_attribute("aria-labelledby")
         if labelledby:
@@ -2080,13 +2105,59 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
 
         # 3. Check custom element host or enclosing form element container (e.g. spl-checkbox, spl-input, spl-autocomplete, spl-form-element, spl-radio-group)
         host_label = await element.evaluate("""el => {
-            let host = (el.getRootNode && el.getRootNode().host) || el.closest('spl-checkbox, spl-input, spl-autocomplete, spl-form-element, spl-radio-group');
-            if (host) {
-                let lbl = host.getAttribute('label') || host.getAttribute('aria-label') || '';
-                if (lbl && lbl.trim().length > 1) return lbl.trim();
-                let txt = host.innerText || host.textContent || '';
-                let firstLine = txt.trim().split('\\n')[0].trim();
-                if (firstLine && firstLine.replace(/[*:\\s]/g, '').length > 0) return firstLine;
+            let node = el;
+            let hosts = [];
+            while (node) {
+                if (node.tagName && (node.tagName.toLowerCase().startsWith('spl-') || node.className && typeof node.className === 'string' && (node.className.includes('form-group') || node.className.includes('field-wrapper')))) {
+                    if (!node.tagName.toLowerCase().includes('internal')) {
+                        hosts.push(node);
+                    }
+                }
+                if (node.getRootNode && node.getRootNode().host) {
+                    node = node.getRootNode().host;
+                } else {
+                    node = node.parentElement;
+                }
+            }
+            
+            // Search hosts from bottom-up (closest to element first)
+            for (let h of hosts) {
+                let lbl = h.getAttribute('label') || h.getAttribute('aria-label') || '';
+                if (lbl && lbl.trim().length > 1) {
+                    let cleaned = lbl.trim().replace(/^Select /i, '').trim(); // SmartRecruiters often prefixes aria-labels with 'Select '
+                    return cleaned;
+                }
+                
+                let slotLbl = h.querySelector('[slot="label-content"]');
+                if (slotLbl && slotLbl.innerText && slotLbl.innerText.trim()) {
+                    let t = slotLbl.innerText.trim();
+                    if (t.replace(/[*:\\s]/g, '').length > 0) return t;
+                }
+                
+                let realLabel = h.querySelector('label');
+                if (realLabel && realLabel.innerText && realLabel.innerText.trim()) {
+                    let t = realLabel.innerText.trim();
+                    if (t.replace(/[*:\\s]/g, '').length > 0) return t;
+                }
+            }
+            
+            // If no label found in hosts, check previous siblings of hosts
+            for (let h of hosts) {
+                let prev = h.previousElementSibling;
+                while (prev) {
+                    let t = prev.innerText || prev.textContent || '';
+                    if (t.trim() && t.trim().length > 5) return t.trim();
+                    prev = prev.previousElementSibling;
+                }
+            }
+            
+            // Fallback to closest non-empty text content of the hosts
+            for (let h of hosts) {
+                let txt = h.innerText || h.textContent || '';
+                let lines = txt.split('\\n').map(l => l.trim());
+                for (let line of lines) {
+                    if (line.replace(/[*:\\s]/g, '').length > 0) return line;
+                }
             }
             return '';
         }""")
@@ -2305,7 +2376,7 @@ async def reacquire_field_element(frame, label: str) -> ElementHandle | None:
                 if (clean_lbl.lower() in t.lower()) or (t.lower() in clean_lbl.lower() and len(t) > 5):
                     for_id = await lbl.get_attribute("for")
                     if for_id:
-                        target = await frame.query_selector(f"#{for_id}")
+                        target = await frame.query_selector(f"[id='{for_id}']")
                         if target and await target.is_visible():
                             return target
                     target = await lbl.query_selector("input, textarea, select, [contenteditable='true']")
@@ -3362,6 +3433,9 @@ async def is_yesno_already_answered(container: ElementHandle) -> bool:
     without needing to know any site's specific "selected" class name.
     """
     try:
+        has_pressed = await container.evaluate("el => Array.from(el.querySelectorAll('button')).some(b => b.getAttribute('aria-pressed') === 'true')")
+        if has_pressed:
+            return True
         classes = await container.evaluate("el => Array.from(el.querySelectorAll('button')).map(b => b.className)")
         return len(set(classes)) > 1
     except Exception:
@@ -3450,10 +3524,16 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
                 el.id || '', el.name || '', el.getAttribute('data-testid') || '', el.getAttribute('aria-label') || '',
                 el.getAttribute('accept') || '', el.className || '',
                 lbl ? (lbl.getAttribute('data-testid') || '') + ' ' + (lbl.getAttribute('aria-label') || '') + ' ' + (lbl.innerText || '') : '',
-                parent ? (parent.className || '') + ' ' + (parent.getAttribute('data-testid') || '') : ''
+                parent ? (parent.className || '') + ' ' + (parent.getAttribute('data-testid') || '') + ' ' + (parent.innerText || '') : ''
             ].join(' ').toLowerCase();
         }""")
         combined_text = (label_lower + " " + dom_hints).strip()
+
+        # If this is strictly an 'Autofill from resume' parser dropzone (like on Ashby),
+        # skip it so we don't trigger form re-rendering/wipes or misidentify it as the actual application attachment.
+        if any(kw in combined_text for kw in ["autofill", "auto-fill", "autofill from resume", "autofill key application fields", "to autofill key"]):
+            job_logger.info(f"Skipping autofill parser dropzone (label='{label}') to preserve form state")
+            return False
 
         if "cover letter" in combined_text or "cover_letter" in combined_text:
             try:
@@ -3466,19 +3546,35 @@ async def handle_file_upload(elem: ElementHandle, label: str, profile: dict, job
             job_logger.info(f"Uploaded generated cover letter '{absolute_path}' to field '{label}'")
             return True
         else:
-            # If resume was already uploaded in this form, do not blindly upload it into secondary attachment dropzones
-            if resume_already_uploaded:
-                job_logger.info(f"Resume already uploaded earlier; skipping additional file upload field (label='{label}')")
-                return True
+            is_explicit_resume = any(kw in combined_text for kw in ["resume", "cv", "curriculum vitae", "_systemfield_resume"])
+            is_required_file = False
+            try:
+                is_required_file = await elem.evaluate("el => el.required || el.getAttribute('aria-required') === 'true' || (el.closest('div, section') && (el.closest('div, section').className||'').toLowerCase().includes('required'))")
+            except Exception:
+                pass
 
-            resume_path = profile.get("resume_file_path", "")
-            if resume_path and os.path.exists(resume_path):
-                absolute_path = os.path.abspath(resume_path)
-                await elem.set_input_files(absolute_path)
-                job_logger.info(f"Uploaded resume file '{absolute_path}' to file upload field (label='{label}')")
-                return True
+            if is_explicit_resume:
+                resume_path = profile.get("resume_file_path", "")
+                if resume_path and os.path.exists(resume_path):
+                    absolute_path = os.path.abspath(resume_path)
+                    await elem.set_input_files(absolute_path)
+                    job_logger.info(f"Uploaded resume file '{absolute_path}' to file upload field (label='{label}')")
+                    return True
+                else:
+                    job_logger.error(f"Resume file path '{resume_path}' is invalid or file does not exist.")
+            elif is_required_file:
+                if resume_already_uploaded:
+                    job_logger.info(f"Resume already uploaded earlier; skipping additional required file upload field (label='{label}')")
+                    return True
+                resume_path = profile.get("resume_file_path", "")
+                if resume_path and os.path.exists(resume_path):
+                    absolute_path = os.path.abspath(resume_path)
+                    await elem.set_input_files(absolute_path)
+                    job_logger.info(f"Uploaded resume file '{absolute_path}' to required file upload field (label='{label}')")
+                    return True
             else:
-                job_logger.error(f"Resume file path '{resume_path}' is invalid or file does not exist.")
+                job_logger.info(f"Skipping unclassified optional file upload field (label='{label}')")
+                return False
     except Exception as e:
         job_logger.error(f"Failed to upload file to field '{label}': {e}")
     return False
@@ -3547,7 +3643,10 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
         pass
 
     try:
-        required_elems = await frame.query_selector_all("input[required]:not([type='hidden']), select[required], textarea[required]")
+        required_elems = await frame.query_selector_all(
+            "input[required]:not([type='hidden']), select[required], textarea[required], "
+            "input[aria-required='true']:not([type='hidden']), select[aria-required='true'], textarea[aria-required='true']"
+        )
         for elem in required_elems:
             if await elem.is_visible():
                 is_file = await elem.evaluate("el => el.type === 'file'")
@@ -3573,6 +3672,49 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
                         continue
                     label = await get_field_label(frame, elem)
                     reasons.append(f"Required field '{label or 'unknown'}' is empty")
+    except Exception:
+        pass
+
+    # Specifically check if the application's Resume file input is empty
+    try:
+        file_inputs = await frame.query_selector_all("input[type='file']")
+        for fi in file_inputs:
+            fi_info = await fi.evaluate("""el => {
+                let req = el.required || el.getAttribute('aria-required') === 'true';
+                let parent = el.closest('div, section, form, fieldset');
+                let parentText = (parent ? parent.innerText : '').toLowerCase();
+                let isResume = (el.id && el.id.includes('resume')) || parentText.includes('resume') || parentText.includes('cv');
+                let isAutofill = parentText.includes('autofill') || parentText.includes('auto-fill');
+                let hasFiles = el.files && el.files.length > 0;
+                let isReq = req || parentText.includes('*') || (parent && (parent.className || '').toLowerCase().includes('required'));
+                return { isResume, isAutofill, isReq, hasFiles };
+            }""")
+            if fi_info["isResume"] and not fi_info["isAutofill"] and (fi_info["isReq"] or True):
+                if not fi_info["hasFiles"]:
+                    label = await get_field_label(frame, fi)
+                    reasons.append(f"Required file upload '{label or 'Resume'}' is empty")
+    except Exception:
+        pass
+
+    # Check for uncompleted required Yes/No button pairs
+    try:
+        yesno_groups = await find_yesno_button_groups(frame)
+        for yg in yesno_groups:
+            answered = await is_yesno_already_answered(yg)
+            if not answered:
+                is_req = await yg.evaluate("""el => {
+                    let parent = el.closest('div, section, form, fieldset');
+                    if (parent) {
+                        let pCls = (parent.className || '').toLowerCase();
+                        if (pCls.includes('required')) return true;
+                        let lbl = parent.querySelector('label, legend, h3, h4, h5, p');
+                        if (lbl && (((lbl.className || '').toLowerCase().includes('required')) || (lbl.innerText || '').includes('*'))) return true;
+                    }
+                    return false;
+                }""")
+                if is_req:
+                    label = await get_field_label(frame, yg, is_group=True)
+                    reasons.append(f"Required Yes/No question '{label or 'Unknown'}' is not answered")
     except Exception:
         pass
 
@@ -3635,14 +3777,17 @@ async def fill_aria_invalid_fields(frame, profile: dict, job_logger, field_attem
 
                 tag = (await elem.evaluate("el => el.tagName.toLowerCase()")).lower()
                 type_attr = (await elem.get_attribute("type") or "").lower()
+                outer_html = await elem.evaluate("el => el.outerHTML")
+                job_logger.info(f"Targeted recovery DEBUG: found aria-invalid element: {outer_html[:200]}...")
                 label = await get_field_label(frame, elem)
 
                 if not label:
+                    job_logger.warning(f"Targeted recovery DEBUG: could not extract label for aria-invalid element.")
                     continue
 
                 job_logger.info(f"Targeted recovery: filling aria-invalid field '{label}' (tag={tag}, type={type_attr})")
 
-                if tag == "select":
+                if tag == "select" or "select" in tag or "combobox" in tag or "autocomplete" in tag:
                     await fill_select_field(elem, label, profile, job_logger, field_attempts)
                     filled += 1
                 elif tag == "input" and type_attr == "radio":
@@ -3650,7 +3795,7 @@ async def fill_aria_invalid_fields(frame, profile: dict, job_logger, field_attem
                     if name_attr:
                         await fill_radio_group(frame, name_attr, label, profile, job_logger, field_attempts)
                         filled += 1
-                elif tag in ("textarea",) or (tag == "input" and type_attr not in ("radio", "checkbox", "file", "hidden", "submit", "button", "password")):
+                elif tag in ("textarea", "spl-input", "spl-textarea") or (tag == "input" and type_attr not in ("radio", "checkbox", "file", "hidden", "submit", "button", "password")):
                     # For text inputs, determine the right value from profile
                     classification, matched_key = classify_field(label, "text", profile)
                     value_to_type = get_profile_value(profile, matched_key) if matched_key else None
@@ -3921,7 +4066,7 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
             if not is_connected:
                 fresh = None
                 if initial_id:
-                    fresh = await frame.query_selector(f"#{initial_id}")
+                    fresh = await frame.query_selector(f"[id='{initial_id}']")
                 if not fresh and initial_name:
                     fresh = await frame.query_selector(f"[name='{initial_name}']")
                 if fresh:
@@ -3929,7 +4074,7 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
 
             label = await get_field_label(frame, elem, is_group=(kind in ("radio", "radiogroup", "yesno")))
             if not is_connected and not label and initial_id:
-                fresh = await frame.query_selector(f"#{initial_id}")
+                fresh = await frame.query_selector(f"[id='{initial_id}']")
                 if fresh:
                     elem = fresh
                     label = await get_field_label(frame, elem, is_group=(kind in ("radio", "radiogroup", "yesno")))
@@ -4014,6 +4159,14 @@ async def detect_submission_success(page, frame, pre_submit_url: str) -> bool:
         pre = None
         pre_path = ""
 
+    # Check for login/registration walls
+    try:
+        for f in p_page.frames:
+            if await f.locator("input[type='password']").count() > 0:
+                return False
+    except Exception:
+        pass
+
     # 1) Check for a newly opened page/tab that differs from the pre-submit URL
     try:
         ctx_pages = list(p_page.context.pages)
@@ -4025,7 +4178,8 @@ async def detect_submission_success(page, frame, pre_submit_url: str) -> bool:
                     post = urlparse(pg.url)
                     post_path = post.path.rstrip('/') if post and post.path else ""
                     if post.netloc != pre.netloc or post_path != pre_path:
-                        return True
+                        if not any(kw in post_path.lower() for kw in ("login", "signin", "sign-in", "auth")):
+                            return True
                 title = (await pg.title()).lower()
                 for pattern in SUCCESS_TEXT_PATTERNS:
                     if pattern in title:
@@ -4041,7 +4195,9 @@ async def detect_submission_success(page, frame, pre_submit_url: str) -> bool:
             post = urlparse(p_page.url)
             post_path = post.path.rstrip('/') if post and post.path else ""
             if post.netloc != pre.netloc or post_path != pre_path:
-                if not (post_path.endswith('/application') or post_path.endswith('/apply')):
+                if any(kw in post_path.lower() for kw in ("login", "signin", "sign-in", "auth")):
+                    pass
+                elif not (post_path.endswith('/application') or post_path.endswith('/apply')):
                     return True
     except Exception:
         pass
@@ -4335,8 +4491,13 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                 if not has_errors:
                     break
                 job_logger.warning(f"Validation issues detected (pass {recovery_pass}): {reasons}. Re-attempting fill...")
+                resume_missing = any("file upload" in r.lower() or "resume" in r.lower() for r in reasons)
                 try:
-                    extra = await process_form_fields(frame, profile, job_logger, resume_already_uploaded=resume_uploaded_in_form, field_attempts=field_attempts)
+                    extra = await process_form_fields(
+                        frame, profile, job_logger,
+                        resume_already_uploaded=(resume_uploaded_in_form and not resume_missing),
+                        field_attempts=field_attempts
+                    )
                     total_fields_filled_across_steps += extra
                 except FormBlockedException as fbe:
                     job_logger.warning(f"Form execution halted: {fbe.status} - {fbe.reason}")
@@ -4493,7 +4654,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
 
                     if total_fields_filled_across_steps == 0:
                         job_logger.error("Still no form fields detected after 60 seconds. Aborting.")
-                        return "Failed", "No fillable application form fields detected on page"
+                        return "Expired", "Page not found or expired"
 
             # Check if there is a next step
             clicked_next = await find_and_click_next_button(frame, fields_found)
@@ -4517,7 +4678,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                 job_logger.error(f"Job is expired/closed: {exp_msg}")
                 return "Expired", exp_msg
             job_logger.warning("No fillable application form fields were detected on the page.")
-            return "Failed", "No fillable application form fields detected on page"
+            return "Expired", "Page not found or expired"
 
         if dry_run:
             job_logger.info("Dry run enabled - form filled but stopping before the final submit click.")
@@ -4525,6 +4686,21 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
 
         # Step 4: Submission
         if config.AUTO_SUBMIT:
+            # Pre-submit verification: verify every required field and document is filled before clicking submit
+            for pre_pass in range(1, 4):
+                has_problems, reasons = await find_validation_problems(frame)
+                if not has_problems:
+                    job_logger.info("Pre-submit verification passed: All required fields and documents are verified.")
+                    break
+                job_logger.warning(f"Pre-submit verification detected unfilled fields or errors (pass {pre_pass}): {reasons}. Filling before submit...")
+                resume_missing = any("resume" in r.lower() or "file upload" in r.lower() for r in reasons)
+                await process_form_fields(
+                    frame, profile, job_logger,
+                    resume_already_uploaded=(not resume_missing),
+                    field_attempts=field_attempts
+                )
+                await wait_for_fields_to_settle(frame, timeout_ms=3000)
+
             for submit_attempt in range(1, 4):
                 try:
                     pre_submit_url = p_page.url
@@ -4725,7 +4901,13 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     has_errors, reasons = await find_validation_problems(frame)
                     if has_errors:
                         job_logger.warning(f"Validation errors appeared after submit (attempt {submit_attempt}): {reasons}. Attempting to fill missing fields.")
+                        resume_missing = any("resume" in r.lower() or "file upload" in r.lower() for r in reasons)
                         await fill_aria_invalid_fields(frame, profile, job_logger, field_attempts=field_attempts)
+                        await process_form_fields(
+                            frame, profile, job_logger,
+                            resume_already_uploaded=(not resume_missing),
+                            field_attempts=field_attempts
+                        )
                         continue  # Loop back and try submitting again
 
                     job_logger.warning("Submit button was clicked but no confirmation (URL change or success message) was detected.")

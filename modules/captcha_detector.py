@@ -45,6 +45,14 @@ async def detect_captcha_or_login_wall(page) -> tuple[str | None, str]:
     except Exception as e:
         logger.debug(f"Error checking frames: {e}")
 
+    # --- 1b. Fast iframe DOM check for Login/Registration walls ---
+    try:
+        for frame in p_page.frames:
+            if await frame.locator("input[type='password']").count() > 0:
+                return "Sign In Required", "Login/Registration wall detected (password field present in frame)"
+    except Exception:
+        pass
+
     # --- 2. High-speed In-Page DOM evaluation (<5ms) ---
     try:
         res = await asyncio.wait_for(p_page.evaluate("""() => {
