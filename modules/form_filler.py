@@ -1600,7 +1600,15 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
     value = get_profile_value(profile, matched_key) if matched_key else None
     if not value and (matched_key in ("country_code", "phone_country_code") or any(kw in label.lower() for kw in ("country code", "phone code", "dialing code"))):
         value = "United States"
-    is_location = matched_key in ("location", "city") or any(kw in label.lower() for kw in ("location", "city", "where are you based", "residence"))
+    is_location = matched_key in ("location", "city") or any(kw in label.lower() for kw in ("location", "city", "where are you based", "currently based", "residence")) or ("where are you" in label.lower() and "based" in label.lower())
+    # Fallback: if we know this is a location field but classify_field didn't match
+    # a profile key, pull the location value from the profile directly.
+    if is_location and not value:
+        value = profile.get("location") or profile.get("city") or ""
+        
+    # Provide a typeable "No" for Hispanic/Latino comboboxes that require typing to open
+    if not value and matched_key is None and any(k in label.lower() for k in ("hispanic", "latino", "ethnicity")):
+        value = "No"
 
     try:
         try:
@@ -2499,7 +2507,7 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
             log_field_decision(job_logger, label, classification, "skipped-conditional-if-yes (answered No)", "")
             return True
 
-    if matched_key in ("location", "city") or any(kw in label_norm for kw in ("location", "city", "where are you based", "residence")):
+    if matched_key in ("location", "city") or any(kw in label_norm for kw in ("location", "city", "where are you based", "currently based", "residence")) or ("where are you" in label_norm and "based" in label_norm):
         return await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key)
 
     # Inspect element attributes to detect if numeric input is required
@@ -3604,6 +3612,108 @@ class FormBlockedException(Exception):
         super().__init__(f"{status}: {reason}")
 
 
+
+async def fill_aria_invalid_fields(frame, profile: dict, job_logger, field_attempts: dict = None) -> int:
+    """
+    Targeted recovery pass: finds all fields marked aria-invalid (reported by
+    the server after a failed submit), scrolls each one into view so off-screen
+    or below-the-fold fields become reachable, then fills them.
+    This is intentionally narrow — it only touches broken fields, not the whole form.
+    """
+    filled = 0
+    try:
+        invalid_elems = await frame.query_selector_all("[aria-invalid='true']")
+        job_logger.info(f"Targeted recovery: found {len(invalid_elems)} aria-invalid field(s).")
+        for elem in invalid_elems:
+            try:
+                # Scroll the element into view first — this is critical for off-screen fields
+                try:
+                    await elem.scroll_into_view_if_needed(timeout=3000)
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+
+                tag = (await elem.evaluate("el => el.tagName.toLowerCase()")).lower()
+                type_attr = (await elem.get_attribute("type") or "").lower()
+                label = await get_field_label(frame, elem)
+
+                if not label:
+                    continue
+
+                job_logger.info(f"Targeted recovery: filling aria-invalid field '{label}' (tag={tag}, type={type_attr})")
+
+                if tag == "select":
+                    await fill_select_field(elem, label, profile, job_logger, field_attempts)
+                    filled += 1
+                elif tag == "input" and type_attr == "radio":
+                    name_attr = await elem.get_attribute("name") or ""
+                    if name_attr:
+                        await fill_radio_group(frame, name_attr, label, profile, job_logger, field_attempts)
+                        filled += 1
+                elif tag in ("textarea",) or (tag == "input" and type_attr not in ("radio", "checkbox", "file", "hidden", "submit", "button", "password")):
+                    # For text inputs, determine the right value from profile
+                    classification, matched_key = classify_field(label, "text", profile)
+                    value_to_type = get_profile_value(profile, matched_key) if matched_key else None
+
+                    # If no profile key matched but the field looks like a location field, use location
+                    label_lower = label.lower()
+                    if not value_to_type and (
+                        "based" in label_lower or "location" in label_lower or "city" in label_lower
+                        or "where are you" in label_lower or "residence" in label_lower
+                    ):
+                        value_to_type = profile.get("location") or profile.get("city") or ""
+
+                    if value_to_type:
+                        # Direct force-type: React/Greenhouse controlled inputs require keyboard events.
+                        # Using .type() (character by character) registers through React's synthetic event
+                        # system, unlike .fill() which sets the DOM value directly and bypasses React state.
+                        try:
+                            await elem.click(timeout=2000)
+                        except Exception:
+                            try:
+                                await elem.click(force=True, timeout=2000)
+                            except Exception:
+                                pass
+                        try:
+                            await elem.press("Control+a", timeout=1000)
+                            await elem.press("Backspace", timeout=1000)
+                        except Exception:
+                            pass
+                        try:
+                            await elem.type(str(value_to_type), delay=30, timeout=5000)
+                        except Exception:
+                            try:
+                                await elem.fill(str(value_to_type), timeout=2000)
+                            except Exception:
+                                pass
+                        # Fire React-compatible events
+                        try:
+                            await elem.evaluate("""el => {
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                                el.dispatchEvent(new Event('blur', { bubbles: true }));
+                            }""")
+                        except Exception:
+                            pass
+                        try:
+                            await elem.press("Tab", timeout=1000)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.3)
+                        committed = await elem.evaluate("el => el.value || ''")
+                        log_field_decision(job_logger, label, classification or "PROFILE_FIELD", "targeted-recovery-type", committed or value_to_type)
+                        filled += 1
+                    else:
+                        # Fall back to standard fill_text_field for non-location fields
+                        await fill_text_field(frame, elem, label, profile, job_logger, field_attempts)
+                        filled += 1
+            except Exception as e:
+                job_logger.warning(f"Targeted recovery: error filling aria-invalid field: {e}")
+    except Exception as e:
+        job_logger.warning(f"Targeted recovery scan failed: {e}")
+    return filled
+
+
 async def process_form_fields(frame, profile: dict, job_logger, resume_already_uploaded: bool = False, field_attempts: dict = None) -> int:
     """
     Enumerates every field type in the current step and fills them in a single
@@ -4199,6 +4309,18 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             await wait_for_fields_to_settle(p_page.main_frame)
             frame = await select_active_frame(p_page)
 
+            # Scroll the form page fully to reveal any below-fold fields before scanning.
+            # Some forms (e.g. Greenhouse on Convoso) place required fields (like
+            # "Where are you currently based?") below the EEO section; if they are
+            # off-screen, is_visible() returns False and we miss them entirely.
+            try:
+                await frame.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(0.3)
+                await frame.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+
             try:
                 fields_found = await process_form_fields(frame, profile, job_logger, resume_already_uploaded=resume_uploaded_in_form, field_attempts=field_attempts)
                 total_fields_filled_across_steps += fields_found
@@ -4598,17 +4720,18 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                         job_logger.warning(f"Submission blocked: {block_reason}")
                         return block_status, block_reason
                     
-                    # NEW: Check for validation errors after clicking submit
+                    # Targeted recovery: only fill the specific fields that failed validation,
+                    # scrolling each into view first (handles off-screen / below-fold fields).
                     has_errors, reasons = await find_validation_problems(frame)
                     if has_errors:
                         job_logger.warning(f"Validation errors appeared after submit (attempt {submit_attempt}): {reasons}. Attempting to fill missing fields.")
-                        await process_form_fields(frame, profile, job_logger, field_attempts=field_attempts)
+                        await fill_aria_invalid_fields(frame, profile, job_logger, field_attempts=field_attempts)
                         continue  # Loop back and try submitting again
 
                     job_logger.warning("Submit button was clicked but no confirmation (URL change or success message) was detected.")
                     return "Failed", "No confirmation of submission detected after clicking submit"
             
-            return "Failed", "Exceeded maximum submission attempts due to recurring validation errors."
+            return "max retries reached", "Exceeded maximum submission attempts due to recurring validation errors."
         else:
             job_logger.info("Auto-submit is disabled. Skipping submission click.")
             return "Submitted", "Auto-submit disabled (manual review mode)"
