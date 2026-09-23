@@ -3634,6 +3634,24 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
     reasons = []
 
     try:
+        # Generic error banner detection
+        banner_texts = await frame.evaluate("""() => {
+            const texts = [];
+            const elems = document.querySelectorAll('.error-message, .alert-danger, [role="alert"], .application-error, .form-error, .error');
+            for (const el of elems) {
+                if (el.offsetWidth > 0 && el.offsetHeight > 0) {
+                    texts.push(el.innerText);
+                }
+            }
+            return texts;
+        }""")
+        for text in banner_texts:
+            if text and len(text.strip()) > 0 and ("error" in text.lower() or "correction" in text.lower() or "missing" in text.lower() or "required" in text.lower()):
+                reasons.append(f"Form error banner: {text.strip()}")
+    except Exception:
+        pass
+
+    try:
         invalid_elems = await frame.query_selector_all("[aria-invalid='true']")
         for elem in invalid_elems:
             if await elem.is_visible():
