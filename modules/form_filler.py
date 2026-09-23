@@ -652,6 +652,14 @@ VETERAN_ANSWER_KEYWORDS = ("not a protected veteran", "not a veteran", "no, i am
 DISABILITY_LABEL_KEYWORDS = ("disability", "disabilities")
 DISABILITY_ANSWER_KEYWORDS = ("don't have", "do not have", "no, i don't", "no, i do not")
 
+# Age Range: always "30-39"
+AGE_LABEL_KEYWORDS = ("age range", "your age", "how old are you")
+AGE_ANSWER = "30-39"
+
+# Race/Ethnicity: always "I prefer not to answer"
+RACE_LABEL_KEYWORDS = ("race", "ethnicity", "identify my ethnicity", "identify your ethnicity")
+RACE_ANSWER_KEYWORDS = ("prefer not", "decline", "do not wish")
+
 # Any label containing these keywords → always answer YES
 ALWAYS_YES_LABEL_KEYWORDS = (
     "remote work experience",
@@ -1532,16 +1540,19 @@ async def read_element_value(elem: ElementHandle) -> str:
     """Best-effort read of a field's current committed value, for post-selection verification and skip checks."""
     try:
         val = await elem.evaluate("""el => {
+            if (el.tagName === 'SELECT') {
+                return (el.value || '').trim();
+            }
             // First check if this element is inside a React-Select / custom combobox container
             const container = el.closest('.select__control, .select-shell, .select__container, [class*="control"], [class*="container"], [class*="select"]');
             if (container) {
-                const singleValue = container.querySelector('.select__single-value, [class*="singleValue"], [class*="single-value"], [class*="SingleValue"], [class*="MultiValue"]');
-                if (singleValue && singleValue.textContent && singleValue.textContent.trim().length > 0) {
+                const singleValue = container.querySelector('.select__single-value, [class*="singleValue"], [class*="single-value"], [class*="SingleValue"], [class*="MultiValue"], .select2-selection__rendered');
+                if (singleValue && singleValue.textContent && singleValue.textContent.trim().length > 0 && singleValue.textContent.trim() !== 'Please select') {
                     return singleValue.textContent.trim();
                 }
                 // If container is a custom combobox/select, the input itself is just a search filter input (e.g. .select__input),
                 // so do NOT return el.value as a committed form value if no singleValue is selected!
-                if (el.classList.contains('select__input') || el.closest('.select__input-container') || el.getAttribute('role') === 'combobox' || el.getAttribute('aria-autocomplete')) {
+                if (el.tagName !== 'SELECT' && (el.classList.contains('select__input') || el.closest('.select__input-container') || el.getAttribute('role') === 'combobox' || el.getAttribute('aria-autocomplete'))) {
                     const hiddenInput = container.querySelector('input[type="hidden"]');
                     if (hiddenInput && hiddenInput.value && hiddenInput.value.trim().length > 0) {
                         return hiddenInput.value.trim();
@@ -1549,12 +1560,28 @@ async def read_element_value(elem: ElementHandle) -> str:
                     return "";
                 }
             }
-            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
                 return (el.value || '').trim();
             }
             if (el.isContentEditable) {
                 return (el.textContent || '').trim();
             }
+            // Deep shadow DOM piercing for custom web components (e.g. SmartRecruiters spl-input)
+            function deepFindInput(root) {
+                if (!root) return null;
+                const inp = root.querySelector('input, textarea');
+                if (inp) return inp;
+                const all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
+                for (const ch of all) {
+                    if (ch.shadowRoot) {
+                        const res = deepFindInput(ch.shadowRoot);
+                        if (res) return res;
+                    }
+                }
+                return null;
+            }
+            const inner = deepFindInput(el.shadowRoot || el);
+            if (inner) return (inner.value || '').trim();
             return (el.value || '').trim();
         }""")
         return (val or "").strip()
@@ -1830,6 +1857,23 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
                             best_text = opt
                             score = 1.0
                             source = "hardcoded-rule (disability: decline)"
+                            break
+                    if best_text:
+                        break
+            elif any(kw in label_norm for kw in AGE_LABEL_KEYWORDS):
+                for opt in option_texts:
+                    if AGE_ANSWER in normalize_text(opt):
+                        best_text = opt
+                        score = 1.0
+                        source = f"hardcoded-rule (age: {AGE_ANSWER})"
+                        break
+            elif any(kw in label_norm for kw in RACE_LABEL_KEYWORDS):
+                for ans_kw in RACE_ANSWER_KEYWORDS:
+                    for opt in option_texts:
+                        if ans_kw in normalize_text(opt):
+                            best_text = opt
+                            score = 1.0
+                            source = "hardcoded-rule (race: decline)"
                             break
                     if best_text:
                         break
@@ -2404,8 +2448,27 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
     """Sets a value on a native input/textarea/select, or types into a contenteditable element with auto-reacquisition."""
     target_elem = elem
     try:
-        # If target_elem has a shadow root with an internal input or textarea, resolve to that inner input
-        inner = await target_elem.evaluate_handle("el => el.shadowRoot ? (el.shadowRoot.querySelector('input, textarea') || el) : el")
+        # Deep pierce through shadow DOMs to find the actual input element
+        inner = await target_elem.evaluate_handle("""el => {
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') return el;
+            
+            function deepFindInput(root) {
+                if (!root) return null;
+                const inp = root.querySelector('input, textarea');
+                if (inp) return inp;
+                const children = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
+                for (const ch of children) {
+                    if (ch.shadowRoot) {
+                        const res = deepFindInput(ch.shadowRoot);
+                        if (res) return res;
+                    }
+                }
+                return null;
+            }
+            
+            const found = deepFindInput(el.shadowRoot || el);
+            return found || el;
+        }""")
         if inner and inner.as_element():
             target_elem = inner.as_element()
     except Exception:
@@ -2466,6 +2529,10 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
             await target_elem.evaluate("(el, v) => { el.innerText = v; }", str(value))
         else:
             await target_elem.fill(str(value), timeout=2500)
+            # Verify if fill worked. Some fields (like "Confirm Email") block pasting/fill.
+            current_val = await target_elem.evaluate("el => el.value")
+            if not current_val:
+                await target_elem.type(str(value), delay=50, timeout=5000)
     except Exception:
         try:
             # Fallback to direct JS property set + events
@@ -2814,6 +2881,21 @@ async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_
                         break
                 if selected_option_text:
                     break
+        elif any(kw in label_norm for kw in AGE_LABEL_KEYWORDS):
+            for opt in options_texts:
+                if AGE_ANSWER in normalize_text(opt):
+                    selected_option_text = opt
+                    source = f"hardcoded-rule (age: {AGE_ANSWER})"
+                    break
+        elif any(kw in label_norm for kw in RACE_LABEL_KEYWORDS):
+            for ans_kw in RACE_ANSWER_KEYWORDS:
+                for opt in options_texts:
+                    if ans_kw in normalize_text(opt):
+                        selected_option_text = opt
+                        source = "hardcoded-rule (race: decline)"
+                        break
+                if selected_option_text:
+                    break
         elif "pronoun" in label_norm:
             # Try He/Him first, then fallback to "Use name only"
             for preferred in PRONOUNS_PREFERRED:
@@ -2963,6 +3045,21 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                     await elem.scroll_into_view_if_needed()
                     await elem.click()
                     return True, "hardcoded-rule (disability: decline)", opt_text
+
+    if any(kw in label_norm for kw in AGE_LABEL_KEYWORDS) or any("30 39" in normalize_text(opt) for opt in options_texts):
+        for elem, opt_text in options:
+            if AGE_ANSWER in normalize_text(opt_text) or "30 39" in normalize_text(opt_text):
+                await elem.scroll_into_view_if_needed()
+                await elem.click()
+                return True, f"hardcoded-rule (age: {AGE_ANSWER})", opt_text
+
+    if any(kw in label_norm for kw in RACE_LABEL_KEYWORDS) or any("hispanic" in normalize_text(opt) for opt in options_texts):
+        for ans_kw in RACE_ANSWER_KEYWORDS:
+            for elem, opt_text in options:
+                if ans_kw in normalize_text(opt_text):
+                    await elem.scroll_into_view_if_needed()
+                    await elem.click()
+                    return True, "hardcoded-rule (race: decline)", opt_text
 
     if any(kw in label_norm for kw in ALWAYS_YES_LABEL_KEYWORDS):
         # Click whichever option says "yes" (case-insensitive)
@@ -3237,6 +3334,10 @@ async def _resolve_checkbox_state(label: str, profile: dict, job_logger) -> tupl
     if any(kw in label_norm for kw in ALWAYS_YES_LABEL_KEYWORDS):
         return True, "hardcoded-rule (always yes)"
 
+    # "Prefer not to answer" / "Decline" standalone checkboxes
+    if any(kw in label_norm for kw in ("prefer not to answer", "prefer not to say", "decline to answer", "decline to self identify", "do not wish to")):
+        return True, "hardcoded-rule (prefer not to answer)"
+
     # Mandatory privacy / policy / declaration / terms checkboxes
     if any(kw in label_norm for kw in ("privacy notice", "terms and conditions", "terms & conditions", "i agree", "i declare", "acknowledge", "declaration", "consent to", "privacy policy")):
         return True, "hardcoded-rule (privacy/consent/terms: agree)"
@@ -3261,6 +3362,23 @@ async def _resolve_checkbox_state(label: str, profile: dict, job_logger) -> tupl
     if label_norm in pronoun_options:
         should_check = label_norm in [normalize_text(p) for p in PRONOUNS_PREFERRED]
         return should_check, "hardcoded-rule (pronouns: He/Him only)"
+
+    # Race/Ethnicity standalone checkboxes (uncheck specific races since we always decline)
+    race_options_keywords = [
+        "white caucasian", "hispanic latino", "spanish origin", "black or african",
+        "native hawaiian", "pacific islander", "indigenous people", "alaska native",
+        "middle eastern", "north african", "some other race", "two or more races",
+        "american indian"
+    ]
+    if label_norm == "asian" or any(kw in label_norm for kw in race_options_keywords):
+        return False, "hardcoded-rule (race: decline, returning false for specific race)"
+
+    # Age standalone checkboxes (uncheck non-30-39 ages)
+    age_options_keywords = [
+        "17 or younger", "18 20", "21 29", "40 49", "50 59", "60 or older"
+    ]
+    if any(kw in label_norm for kw in age_options_keywords):
+        return False, "hardcoded-rule (age: decline, returning false for non-30-39 age)"
 
     classification, matched_key = classify_field(label, "checkbox", profile)
     profile_value = get_profile_value(profile, matched_key)
@@ -3667,6 +3785,11 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
         )
         for elem in required_elems:
             if await elem.is_visible():
+                # Skip checkboxes — their "value" is irrelevant; .checked state matters
+                elem_type = await elem.evaluate("el => (el.type || '').toLowerCase()")
+                if elem_type == "checkbox":
+                    continue
+
                 is_file = await elem.evaluate("el => el.type === 'file'")
                 if is_file:
                     has_files = await elem.evaluate("el => el.files && el.files.length > 0")
@@ -3675,21 +3798,14 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
                         reasons.append(f"Required file upload '{label or 'Resume'}' is empty")
                     continue
 
-                value = await elem.evaluate("el => el.value")
+                # Call read_element_value directly instead of duplicating JS logic
+                value = await read_element_value(elem)
                 if not value or not str(value).strip():
-                    # For React-Select or custom comboboxes, check if the parent container actually has a singleValue selected
-                    has_combobox_val = await elem.evaluate("""el => {
-                        const container = el.closest('.select, .select-shell, .select__container, [class*="react-select"], [class*="select"]');
-                        if (container) {
-                            const valEl = container.querySelector('.select__single-value, [class*="singleValue"], [class*="single-value"], [class*="SingleValue"]');
-                            if (valEl && valEl.textContent && valEl.textContent.trim().length > 0) return true;
-                        }
-                        return false;
-                    }""")
-                    if has_combobox_val:
-                        continue
                     label = await get_field_label(frame, elem)
-                    reasons.append(f"Required field '{label or 'unknown'}' is empty")
+                    # Only flag if we have a real label — unlabeled hidden inputs (e.g. inside custom
+                    # checkbox components) are not real empty fields, they are framework internals.
+                    if label and label.strip():
+                        reasons.append(f"Required field '{label}' is empty")
     except Exception:
         pass
 
@@ -4138,6 +4254,83 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
             raise
         except Exception as e:
             job_logger.warning(f"Skipping a '{kind}' field mid-pass due to an error (likely a stale element from a re-render earlier in this pass): {e}")
+
+    # -----------------------------------------------------------------------
+    # Final re-fill: "Confirm email" fields MUST be filled last.
+    # SmartRecruiters clears the confirm-email field whenever any other field
+    # on the same step triggers a React state update. Re-filling it at the
+    # very end of every pass ensures it's populated when validation runs.
+    # -----------------------------------------------------------------------
+    email_val = str(profile.get("email", "")).strip()
+    if email_val:
+        for _, kind, elem, extra, initial_id, initial_name in tasks:
+            try:
+                if kind != "text":
+                    continue
+                lbl = await get_field_label(frame, elem, is_group=False)
+                lbl_lower = lbl.lower()
+                if "confirm" not in lbl_lower or "email" not in lbl_lower:
+                    continue
+                # Re-acquire element if detached
+                try:
+                    is_connected = await elem.evaluate("el => el.isConnected === true")
+                except Exception:
+                    is_connected = False
+                if not is_connected:
+                    fresh = None
+                    if initial_id:
+                        fresh = await frame.query_selector(f"[id='{initial_id}']")
+                    if not fresh and initial_name:
+                        fresh = await frame.query_selector(f"[name='{initial_name}']")
+                    if fresh:
+                        elem = fresh
+                    else:
+                        continue
+                # Check current value — re-fill only if empty or mismatched
+                curr_val = await read_element_value(elem)
+                if curr_val and curr_val.strip().lower() == email_val.lower():
+                    continue  # already correct, skip
+                job_logger.info(f"Re-filling '{lbl}' at end of pass (cleared by site): '{email_val}'")
+                # Pierce shadow DOM to reach the actual <input>
+                try:
+                    inner_handle = await elem.evaluate_handle("""el => {
+                        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') return el;
+                        function deepFind(root) {
+                            if (!root) return null;
+                            const inp = root.querySelector('input, textarea');
+                            if (inp) return inp;
+                            const all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
+                            for (const ch of all) {
+                                if (ch.shadowRoot) { const r = deepFind(ch.shadowRoot); if (r) return r; }
+                            }
+                            return null;
+                        }
+                        return deepFind(el.shadowRoot || el) || el;
+                    }""")
+                    target = inner_handle.as_element() if inner_handle else elem
+                    await target.fill(email_val, force=True)
+                    check = await target.evaluate("el => el.value")
+                    if not check:
+                        await target.focus()
+                        await target.type(email_val, delay=40)
+                except Exception:
+                    try:
+                        await elem.focus()
+                        await elem.type(email_val, delay=40)
+                    except Exception:
+                        pass
+                # Fire events so React registers the value
+                try:
+                    await elem.evaluate("""el => {
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""")
+                except Exception:
+                    pass
+            except FormBlockedException:
+                raise
+            except Exception:
+                pass
 
     return len(tasks)
 
