@@ -3189,10 +3189,16 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
     for elem, opt_text in options:
         if opt_text and (opt_text.lower() == selected_option_text.lower() or selected_option_text.lower() in opt_text.lower()):
             await elem.scroll_into_view_if_needed()
-            await elem.click()
+            try:
+                await elem.click(force=True)
+            except Exception:
+                await elem.click()
             return True, source, opt_text
 
-    await options[0][0].click()
+    try:
+        await options[0][0].click(force=True)
+    except Exception:
+        await options[0][0].click()
     return True, "fallback-first-option", options[0][1]
 
 
@@ -3208,6 +3214,20 @@ async def fill_radio_group(frame, name_attr: str, label: str, profile: dict, job
                 l_elem = await frame.query_selector(f"label[for='{r_id}']")
                 if l_elem:
                     r_label = await l_elem.inner_text()
+            if not r_label.strip():
+                aria_labelledby = await r.get_attribute("aria-labelledby")
+                if aria_labelledby:
+                    ids = aria_labelledby.split()
+                    texts = []
+                    for lid in ids:
+                        try:
+                            lbl = await frame.query_selector(f"[id='{lid}']")
+                            if lbl:
+                                t = (await lbl.inner_text()).strip()
+                                if t: texts.append(t)
+                        except Exception:
+                            pass
+                    r_label = " ".join(texts)
             if not r_label.strip():
                 r_label = await r.evaluate("el => el.parentElement.innerText")
             radio_options.append((r, r_label.strip()))
@@ -3274,6 +3294,20 @@ async def fill_aria_radio_group(frame, group_elem: ElementHandle, label: str, pr
         radio_options = []
         for r in radios:
             r_label = (await r.get_attribute("label")) or (await r.get_attribute("aria-label")) or ""
+            if not r_label.strip():
+                aria_labelledby = await r.get_attribute("aria-labelledby")
+                if aria_labelledby:
+                    ids = aria_labelledby.split()
+                    texts = []
+                    for lid in ids:
+                        try:
+                            lbl = await frame.query_selector(f"[id='{lid}']")
+                            if lbl:
+                                t = (await lbl.inner_text()).strip()
+                                if t: texts.append(t)
+                        except Exception:
+                            pass
+                    r_label = " ".join(texts)
             if not r_label.strip():
                 r_label = (await r.inner_text()).strip()
             if not r_label.strip():
@@ -3798,6 +3832,16 @@ async def find_validation_problems(frame) -> tuple[bool, list[str]]:
                         reasons.append(f"Required file upload '{label or 'Resume'}' is empty")
                     continue
 
+                if elem_type == "radio":
+                    name = await elem.get_attribute("name")
+                    if name:
+                        is_group_checked = await frame.evaluate(f"() => !!document.querySelector('input[type=\"radio\"][name=\"{name}\"]:checked')")
+                        if not is_group_checked:
+                            label = await get_field_label(frame, elem)
+                            if label and label.strip():
+                                reasons.append(f"Required radio group '{label}' has no selection")
+                    continue
+
                 # Call read_element_value directly instead of duplicating JS logic
                 value = await read_element_value(elem)
                 if not value or not str(value).strip():
@@ -4032,7 +4076,7 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
             if await is_chat_or_support_element(elem):
                 continue
             is_hidden_helper = await elem.evaluate("""el => {
-                if (el.tagName === 'INPUT' && el.type !== 'file') {
+                if (el.tagName === 'INPUT' && el.type !== 'file' && el.type !== 'radio' && el.type !== 'checkbox') {
                     if (el.getAttribute('tabindex') === '-1' || el.getAttribute('aria-hidden') === 'true') return true;
                     if (el.className && el.className.includes('requiredInput')) return true;
                 }
