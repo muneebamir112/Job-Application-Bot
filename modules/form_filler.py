@@ -131,10 +131,20 @@ PROFILE_FIELD_SYNONYMS = {
         "school", "university", "college", "institution", "school name",
         "where did you attend", "name of school",
     ],
+    # education_major matches major/discipline inputs
+    "education_major": [
+        "major", "discipline", "field of study", "course of study", "program of study"
+    ],
     # education_year matches graduation year fields
     "education_year": [
         "graduation year", "year of graduation", "year graduated",
         "when did you graduate", "grad year",
+    ],
+    "education_start_year": [
+        "start date year", "start year"
+    ],
+    "education_end_year": [
+        "end date year", "end year"
     ],
     # education (full block) — used for open-text academic background summaries
     "education": ["education", "academic background", "qualification"],
@@ -282,12 +292,36 @@ def get_profile_value(profile: dict, key: str | None) -> str | None:
                 return str(first.get("school", "")).strip() or None
         return None
 
+    if key == "education_major":
+        edu_list = profile.get("education")
+        if isinstance(edu_list, list) and edu_list:
+            first = edu_list[0]
+            if isinstance(first, dict):
+                return str(first.get("major", "")).strip() or None
+        return None
+
     if key == "education_year":
         edu_list = profile.get("education")
         if isinstance(edu_list, list) and edu_list:
             first = edu_list[0]
             if isinstance(first, dict):
                 return str(first.get("year", "")).strip() or None
+        return None
+
+    if key == "education_start_year":
+        edu_list = profile.get("education")
+        if isinstance(edu_list, list) and edu_list:
+            first = edu_list[0]
+            if isinstance(first, dict):
+                return str(first.get("start_year", "")).strip() or None
+        return None
+
+    if key == "education_end_year":
+        edu_list = profile.get("education")
+        if isinstance(edu_list, list) and edu_list:
+            first = edu_list[0]
+            if isinstance(first, dict):
+                return str(first.get("end_year", "")).strip() or None
         return None
 
     if key == "city":
@@ -629,7 +663,7 @@ WORK_AUTHORIZATION_STATEMENT_KEYWORDS = ("authorized to work", "legally authoriz
 # ---------------------------------------------------------------------------
 
 # Pronouns: always He/Him. Fallback to "Use name only" if He/Him not present.
-PRONOUNS_PREFERRED = ["he/him", "he him"]
+PRONOUNS_PREFERRED = ["he/him", "he him", "he/him/his", "he him his"]
 PRONOUNS_FALLBACK = ["use name only", "prefer not to say"]
 
 # Gender: always Male
@@ -684,6 +718,7 @@ ALWAYS_YES_LABEL_KEYWORDS = (
     "i acknowledge",
     "i certify",
     "by checking this box",
+    "acknowledgement",
 )
 
 # Any label containing these keywords → always answer NO
@@ -728,6 +763,7 @@ ALWAYS_NO_LABEL_KEYWORDS = (
     "misdemeanor",
     "criminal conviction",
     "ever been convicted",
+    "transgender",
     "hispanic",
     "latino",
     "are you hispanic",
@@ -738,6 +774,13 @@ ALWAYS_NO_LABEL_KEYWORDS = (
     "hispanic or latino",
     "hispanic origin",
     "latino origin",
+    "ever been employed by",
+    "federal government",
+    "state or local government",
+    "security clearance",
+    "seneca nation",
+    "travel agent",
+    "customer service"
 )
 
 # Follow-up questions that ask for explanation only IF the previous question was answered YES
@@ -919,8 +962,8 @@ async def ask_ollama_open_ended(label: str, profile: dict, job_logger, classific
     assert classification == "OPEN_ENDED", "Ollama may only produce free text for OPEN_ENDED fields"
 
     profile_context = json_context_string(profile)
-    # Use concise resume context (~1200 chars) so local LLMs respond quickly
-    resume_text = (profile.get("resume_text") or "")[:1200]
+    # Use larger resume context (~4000 chars) to ensure experience/skills aren't truncated
+    resume_text = (profile.get("resume_text") or "")[:4000]
     job_title = profile.get("job_title") or "the role"
     company_name = profile.get("company_name") or "the company"
     profile_name = profile.get("name") or profile.get("full_name") or "the candidate"
@@ -959,7 +1002,7 @@ Write plain prose only - act as {profile_name}, no markdown formatting of any ki
 """
     job_logger.info(f"Open-ended field detected: '{label}'. Querying Ollama...")
     try:
-        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT, options={"num_predict": 256})
+        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
     except Exception as e:
         job_logger.warning(f"Ollama call for '{label}' failed or timed out: {e}. Using intelligent fallback.")
         label_lower = label.lower()
@@ -1009,20 +1052,28 @@ async def ask_ollama_choice(label: str, options: list[str], profile: dict, job_l
     """Ollama is given the list of rendered options and must pick one."""
     assert classification == "CHOICE_FIELD", "Ollama choice picker may only run for CHOICE_FIELD"
     profile_context = json_context_string(profile)
+    resume_text = (profile.get("resume_text") or "")[:4000]
     options_str = str(options)
 
     system_prompt = (
-        "You are the candidate applying for this job. The Candidate Profile provided is YOUR personal background and YOUR identity. "
+        "You are the candidate applying for this job. The Candidate Profile and Resume provided are YOUR personal background and YOUR identity. "
         "Output ONLY the exact text of the option that best matches the question/context based on your identity and background. "
         "NEVER refer to 'the candidate', 'the profile', or yourself as an AI. "
         "CRITICAL INSTRUCTION FOR SALARY: If a question asks whether a target salary range meets your requirements or expectations, "
         "and your profile's expected salary is LESS THAN or WITHIN that range, you MUST select 'Yes'. "
+        "CRITICAL INSTRUCTION FOR SKILLS/TOOLS: If a question asks about your years of experience or proficiency with a specific tool, technology, or skill (e.g., Unreal Engine, C++, Golang) "
+        "and that specific tool is NOT explicitly mentioned in your Profile's skills list (ignore the Resume summary for this check), you MUST strictly select the option indicating '0 years', 'None', or 'No experience'. "
+        "DO NOT extrapolate. DO NOT assume you have experience with it just because you have 8+ years of general software engineering experience. If the keyword is missing from your skills list, your experience is strictly 0. "
+        "CRITICAL INSTRUCTION FOR AFFILIATIONS/HISTORY: If a question asks if you have previously worked for the company, have family members at the company, are a member of a specific tribe/nation (e.g., Seneca Nation), or have worked for the Federal/State Government, you MUST strictly select 'No'. "
         "If a question asks for a preference or something not explicitly stated, use your professional judgment to deduce a reasonable answer as if you were this person. "
         "Do not include markdown or explanations. Output the exact option text only."
     )
     prompt = f"""
 Your Profile:
 {profile_context}
+
+Your Resume summary:
+{resume_text}
 
 Question:
 {label}
@@ -1033,7 +1084,7 @@ Options:
 Choose the single best matching option. Your response MUST be exactly one of the options from the list above:
 """
     try:
-        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT, options={"num_predict": 32})
+        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
     except Exception as e:
         job_logger.warning(f"Ollama choice call for '{label}' failed or timed out: {e}. Falling back to default option.")
         # Return first non-placeholder option, not blindly options[0]
@@ -1087,7 +1138,7 @@ Question:
 Provide the numeric value only:
 """
     try:
-        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT, options={"num_predict": 16})
+        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
     except Exception as e:
         job_logger.warning(f"Ollama numeric call for '{label}' failed: {e}. Using fallback 5.")
         raw_answer = "5"
@@ -1557,6 +1608,10 @@ async def read_element_value(elem: ElementHandle) -> str:
                     if (hiddenInput && hiddenInput.value && hiddenInput.value.trim().length > 0) {
                         return hiddenInput.value.trim();
                     }
+                    const hiddenSelect = container.querySelector('select');
+                    if (hiddenSelect && hiddenSelect.value && hiddenSelect.value.trim().length > 0 && hiddenSelect.value.trim() !== '-1') {
+                        return hiddenSelect.value.trim();
+                    }
                     return "";
                 }
             }
@@ -1649,6 +1704,10 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
         value = "prefer not"
     if not value and matched_key is None and "veteran" in label.lower():
         value = "not a protected veteran"
+    if not value and matched_key is None and any(kw in label.lower() for kw in ALWAYS_NO_LABEL_KEYWORDS):
+        value = "No"
+    if not value and matched_key is None and any(kw in label.lower() for kw in ALWAYS_YES_LABEL_KEYWORDS):
+        value = "Yes"
 
     try:
         try:
@@ -1906,7 +1965,8 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
                         break
             elif any(kw in label_norm for kw in ALWAYS_NO_LABEL_KEYWORDS):
                 for opt in option_texts:
-                    if normalize_text(opt) in ("no", "n", "false") or normalize_text(opt).startswith("no"):
+                    norm_opt = normalize_text(opt)
+                    if norm_opt in ("no", "n", "false", "none", "n/a", "not applicable") or norm_opt.startswith("no ") or norm_opt.startswith("none"):
                         best_text = opt
                         score = 1.0
                         source = "hardcoded-rule (always no)"
@@ -2054,8 +2114,15 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
                 log_field_decision(job_logger, label, "PROFILE_FIELD", "profile.json", value)
                 return True
             else:
-                job_logger.warning(f"Custom combobox '{label}' could not match or click an option for value '{value}'. Leaving for retry.")
-                return False
+                job_logger.warning(f"Custom combobox '{label}' could not match or click an option for value '{value}'. Blindly committing.")
+                try:
+                    await target_input.press("Enter", timeout=1000)
+                    await asyncio.sleep(0.3)
+                    await target_input.press("Tab", timeout=1000)
+                except Exception:
+                    pass
+                log_field_decision(job_logger, label, "CHOICE_FIELD", "combobox-blind-commit", value)
+                return True
 
         job_logger.warning(f"Combobox '{label}' had no profile match and no options rendered on focus. Leaving unanswered.")
         log_field_decision(job_logger, label, "CHOICE_FIELD", "skipped-no-options", None)
@@ -2091,19 +2158,40 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
                     let t = internalLeg.innerText.trim();
                     if (t.length > 5) return t;
                 }
-                let fieldset = el.closest('fieldset');
+                let fieldset = el.closest('fieldset, [role="group"], [role="radiogroup"]');
                 if (fieldset) {
-                    let legend = fieldset.querySelector('legend');
-                    if (legend && legend.innerText.trim()) return legend.innerText.trim();
+                    let legend = fieldset.querySelector('legend, label, [class*="question"], [class*="title"], [class*="legend"], h1, h2, h3, h4, h5, h6, p');
+                    if (legend && legend.innerText && legend.innerText.trim()) {
+                        let t = legend.innerText.trim();
+                        if (t.length > 5) return t;
+                    }
                 }
                 let node = el;
                 for (let depth = 0; depth < 5 && node; depth++) {
                     if (node.previousElementSibling) {
-                        const text = node.previousElementSibling.innerText || node.previousElementSibling.textContent || '';
-                        // Usually questions are longer than 5 chars, filters out tiny UI artifacts
-                        if (text.trim() && text.trim().length > 5) return text.trim();
+                        let prev = node.previousElementSibling;
+                        // Avoid grabbing the previous form field entirely (which contains inputs/options)
+                        if (!prev.querySelector('input, textarea, select, button')) {
+                            const text = prev.innerText || prev.textContent || '';
+                            // Usually questions are longer than 5 chars, filters out tiny UI artifacts
+                            if (text.trim() && text.trim().length > 5) return text.trim();
+                        }
                     }
                     node = node.parentElement;
+                }
+                
+                // If previousElementSibling failed, look for a header-like element in the container
+                node = el;
+                for (let depth = 0; depth < 5 && node; depth++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const candidates = node.querySelectorAll('p, h1, h2, h3, h4, h5, h6, span, div, label, legend');
+                    for (const c of candidates) {
+                        if (c === el || c.contains(el)) continue;
+                        if (c.querySelector('input, textarea, select, button')) continue;
+                        const text = (c.innerText || c.textContent || '').trim();
+                        if (text && text.length > 5 && text.length < 300) return text;
+                    }
                 }
                 return '';
             }""")
@@ -2568,18 +2656,24 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
     """Fills a text input, textarea, or contenteditable element."""
     if not label or not label.strip():
         return False
+    
+    if label.strip().lower() == "search":
+        return True
 
     # The validation-recovery loop re-scans the whole form; skip fields that
     # already have a value rather than re-filling (and, for OPEN_ENDED fields,
     # re-querying Ollama) all over again on every retry pass.
     # However, do NOT skip if the field is marked aria-invalid (post-submit validation error).
     existing_value = await read_element_value(elem)
-    if existing_value:
+    is_invalid = False
+    try:
+        is_invalid = await elem.evaluate("el => el.getAttribute('aria-invalid') === 'true' || el.classList.contains('error') || el.classList.contains('has-error')")
+    except Exception:
+        pass
+
+    if existing_value and not is_invalid:
         try:
-            is_invalid = await elem.get_attribute("aria-invalid")
-            if is_invalid and is_invalid.lower() == "true":
-                pass  # Field has a value but is marked invalid; fall through to re-fill
-            elif "email" in label.lower() and profile.get("email") and existing_value.strip().lower() != str(profile.get("email")).strip().lower():
+            if "email" in label.lower() and profile.get("email") and existing_value.strip().lower() != str(profile.get("email")).strip().lower():
                 pass  # Pre-filled email from resume autofill differs from target profile email; overwrite
             else:
                 return True
@@ -2602,6 +2696,15 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
     label_norm = normalize_text(label)
 
     # --- Permanent hardcoded rules for text fields (run before profile matching) ---
+    if any(kw in label_norm for kw in ("hourly rate", "per hour", "hourly compensation")):
+        try:
+            await set_field_value(elem, "50", frame=frame, label=label)
+            log_field_decision(job_logger, label, classification, "hardcoded-rule (hourly rate -> 50)", "50")
+            return True
+        except Exception as e:
+            job_logger.error(f"Failed to fill text field '{label}': {e}")
+            return False
+
     if any(kw in label_norm for kw in ALWAYS_YES_LABEL_KEYWORDS):
         try:
             await set_field_value(elem, "Yes", frame=frame, label=label)
@@ -2923,7 +3026,8 @@ async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_
                     break
         elif any(kw in label_norm for kw in ALWAYS_NO_LABEL_KEYWORDS):
             for opt in options_texts:
-                if normalize_text(opt) in ("no", "n", "false") or normalize_text(opt).startswith("no"):
+                norm_opt = normalize_text(opt)
+                if norm_opt in ("no", "n", "false", "none", "n/a", "not applicable") or norm_opt.startswith("no ") or norm_opt.startswith("none"):
                     selected_option_text = opt
                     source = "hardcoded-rule (always no)"
                     break
@@ -2993,6 +3097,19 @@ async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_
                 return False
 
         await elem.select_option(value=matching_value)
+        # For jQuery plugins like Select2 (Greenhouse), we must trigger the jQuery change event
+        try:
+            await elem.evaluate("""el => {
+                const jq = window.jQuery || window.$;
+                if (jq) {
+                    jq(el).trigger('change');
+                    jq(el).trigger('change.select2');
+                }
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            }""")
+        except Exception:
+            pass
         log_field_decision(job_logger, label, classification, source, final_text)
         return True
     except Exception as e:
@@ -3013,21 +3130,30 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         for elem, opt_text in options:
             if normalize_text(opt_text) == CITIZENSHIP_ANSWER:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, f"hardcoded-rule (citizenship: {CITIZENSHIP_ANSWER})", opt_text
 
     if any(kw in label_norm for kw in LANGUAGE_LABEL_KEYWORDS):
         for elem, opt_text in options:
             if normalize_text(opt_text) == LANGUAGE_ANSWER:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, f"hardcoded-rule (language: {LANGUAGE_ANSWER})", opt_text
 
     if any(kw in label_norm for kw in GENDER_LABEL_KEYWORDS):
         for elem, opt_text in options:
             if normalize_text(opt_text) == GENDER_ANSWER:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, f"hardcoded-rule (gender: {GENDER_ANSWER})", opt_text
 
     if any(kw in label_norm for kw in VETERAN_LABEL_KEYWORDS) or any("protected veteran" in normalize_text(opt) for opt in options_texts):
@@ -3035,7 +3161,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             for elem, opt_text in options:
                 if ans_kw in normalize_text(opt_text):
                     await elem.scroll_into_view_if_needed()
-                    await elem.click()
+                    try:
+                        await elem.click()
+                    except Exception:
+                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                     return True, "hardcoded-rule (veteran: decline)", opt_text
 
     if any(kw in label_norm for kw in DISABILITY_LABEL_KEYWORDS) or any("disability" in normalize_text(opt) for opt in options_texts):
@@ -3043,14 +3172,20 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             for elem, opt_text in options:
                 if ans_kw in normalize_text(opt_text):
                     await elem.scroll_into_view_if_needed()
-                    await elem.click()
+                    try:
+                        await elem.click()
+                    except Exception:
+                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                     return True, "hardcoded-rule (disability: decline)", opt_text
 
     if any(kw in label_norm for kw in AGE_LABEL_KEYWORDS) or any("30 39" in normalize_text(opt) for opt in options_texts):
         for elem, opt_text in options:
             if AGE_ANSWER in normalize_text(opt_text) or "30 39" in normalize_text(opt_text):
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, f"hardcoded-rule (age: {AGE_ANSWER})", opt_text
 
     if any(kw in label_norm for kw in RACE_LABEL_KEYWORDS) or any("hispanic" in normalize_text(opt) for opt in options_texts):
@@ -3058,7 +3193,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             for elem, opt_text in options:
                 if ans_kw in normalize_text(opt_text):
                     await elem.scroll_into_view_if_needed()
-                    await elem.click()
+                    try:
+                        await elem.click()
+                    except Exception:
+                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                     return True, "hardcoded-rule (race: decline)", opt_text
 
     if any(kw in label_norm for kw in ALWAYS_YES_LABEL_KEYWORDS):
@@ -3066,25 +3204,37 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         for elem, opt_text in options:
             if normalize_text(opt_text) in ("yes", "y", "true"):
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "hardcoded-rule (always yes)", opt_text
         # Fallback: click first option whose text starts with "yes"
         for elem, opt_text in options:
             if normalize_text(opt_text).startswith("yes"):
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "hardcoded-rule (always yes - prefix match)", opt_text
 
     if any(kw in label_norm for kw in ALWAYS_NO_LABEL_KEYWORDS):
         for elem, opt_text in options:
             if normalize_text(opt_text) in ("no", "n", "false"):
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "hardcoded-rule (always no)", opt_text
         for elem, opt_text in options:
             if normalize_text(opt_text).startswith("no"):
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "hardcoded-rule (always no - prefix match)", opt_text
 
     # Pronouns radio group: prefer He/Him, fallback to "Use name only"
@@ -3093,13 +3243,19 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             for elem, opt_text in options:
                 if normalize_text(opt_text) in [normalize_text(preferred), preferred.replace("/", " ")]:
                     await elem.scroll_into_view_if_needed()
-                    await elem.click()
+                    try:
+                        await elem.click()
+                    except Exception:
+                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                     return True, "hardcoded-rule (pronouns: He/Him)", opt_text
         for fallback in PRONOUNS_FALLBACK:
             for elem, opt_text in options:
                 if normalize_text(fallback) in normalize_text(opt_text):
                     await elem.scroll_into_view_if_needed()
-                    await elem.click()
+                    try:
+                        await elem.click()
+                    except Exception:
+                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                     return True, "hardcoded-rule (pronouns: Use name only fallback)", opt_text
 
     if is_eeo_race_question(options_texts):
@@ -3110,7 +3266,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             opt_norm = normalize_text(opt_text)
             if "decline" in opt_norm and "self identify" in opt_norm:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "profile.json (race/ethnicity always declined)", opt_text
 
         category = resolve_eeo_race_category(profile.get("location") or "")
@@ -3120,7 +3279,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                 for elem, opt_text in options:
                     if opt_text == best_text:
                         await elem.scroll_into_view_if_needed()
-                        await elem.click()
+                        try:
+                            await elem.click()
+                        except Exception:
+                            await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                         return True, f"profile.json (location-based race category: {category})", opt_text
 
     forced_choice = resolve_visa_sponsorship_choice(label_norm, options_texts, profile)
@@ -3128,7 +3290,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         for elem, opt_text in options:
             if opt_text == forced_choice:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "profile.json (visa sponsorship not needed -> legally authorized statement)", opt_text
 
     gender_id_choice = resolve_gender_identity_choice(label_norm, options_texts)
@@ -3136,7 +3301,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         for elem, opt_text in options:
             if opt_text == gender_id_choice:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "hardcoded-rule (gender identity)", opt_text
 
     hispanic_choice = resolve_hispanic_latino_choice(label_norm, options_texts)
@@ -3144,7 +3312,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         for elem, opt_text in options:
             if opt_text == hispanic_choice:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "hardcoded-rule (hispanic/latino: no)", opt_text
 
     eeo_race_choice = resolve_eeo_race_choice(label_norm, options_texts)
@@ -3152,7 +3323,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         for elem, opt_text in options:
             if opt_text == eeo_race_choice:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "hardcoded-rule (race: white/decline)", opt_text
 
     source_choice = resolve_hear_about_us_choice(label_norm, options_texts)
@@ -3160,7 +3334,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         for elem, opt_text in options:
             if opt_text == source_choice:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "hardcoded-rule (hear about us: job board/linkedin)", opt_text
 
     skill_choice = resolve_skills_experience_choice(label_norm, options_texts, profile)
@@ -3168,7 +3345,10 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         for elem, opt_text in options:
             if opt_text == skill_choice:
                 await elem.scroll_into_view_if_needed()
-                await elem.click()
+                try:
+                    await elem.click()
+                except Exception:
+                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
                 return True, "profile.json (skills/resume match)", opt_text
 
     matched_key = find_profile_synonym_match(label)
@@ -3190,7 +3370,7 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         if opt_text and (opt_text.lower() == selected_option_text.lower() or selected_option_text.lower() in opt_text.lower()):
             await elem.scroll_into_view_if_needed()
             try:
-                await elem.click(force=True)
+                await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
             except Exception:
                 await elem.click()
             return True, source, opt_text
@@ -3425,12 +3605,23 @@ async def _resolve_checkbox_state(label: str, profile: dict, job_logger) -> tupl
         if any(s == label_norm or (len(s) > 2 and s in label_norm) or (len(label_norm) > 2 and label_norm in s) for s in candidate_skills):
             return True, "profile.json (skills match)"
 
+        resume_text = (profile.get("resume_text") or "")[:4000]
+
         # No usable profile-derived yes/no signal for this checkbox - fall back
         # to Ollama deciding check/uncheck (still not free text, just a binary state)
-        system_prompt = "You are a job application bot. Return 'yes' if the checkbox should be checked or 'no' if not. Be concise."
+        system_prompt = (
+            "You are a job application bot evaluating a single checkbox option. Return 'yes' if the checkbox should be checked or 'no' if not. Be concise. "
+            "CRITICAL INSTRUCTION FOR SKILLS/TOOLS: If the checkbox label is a specific tool, technology, or skill (e.g., Unreal Engine, C++, Golang) "
+            "and that specific tool is NOT explicitly mentioned in the Candidate profile details skills list (ignore the Resume summary for this check), you MUST strictly answer 'no'. "
+            "DO NOT extrapolate. DO NOT assume the candidate has experience with it just because they have general software engineering experience. If the keyword is missing from the skills list, the answer is 'no'. "
+            "CRITICAL INSTRUCTION FOR AFFILIATIONS/HISTORY: If the checkbox label asks if you have previously worked for the company, have family members at the company, are a member of a specific tribe/nation (e.g., Seneca Nation), or have worked for the Federal/State Government, you MUST strictly answer 'no'."
+        )
         prompt = f"""
 Candidate profile details:
 {json_context_string(profile)}
+
+Your Resume summary:
+{resume_text}
 
 Checkbox Label:
 {label}
@@ -4527,6 +4718,25 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
         if block_status:
             return block_status, block_reason
 
+        is_closed = await page.evaluate("""() => {
+            const text = document.body.innerText.toLowerCase();
+            const closedPhrases = [
+                'job is no longer available',
+                'job is no longer open',
+                'this position has been closed',
+                'not accepting applications',
+                'job has expired',
+                'role is no longer open'
+            ];
+            for (const p of closedPhrases) {
+                if (text.includes(p)) return true;
+            }
+            return false;
+        }""")
+        if is_closed:
+            job_logger.warning("Job appears to be closed/expired.")
+            return "Failed", "Job is no longer open / expired."
+
         p_page = _get_raw_playwright_page(page)
 
         # Early check for expired / closed / 404 job postings
@@ -4575,6 +4785,8 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             "button:has-text('Apply for this job')",
             "a:has-text('Apply for this job')",
             "button:has-text('Apply to job')",
+            "button:has-text('Apply To Position')",
+            "a:has-text('Apply To Position')",
             "a:has-text('Apply to job')",
             "button:has-text('Start Application')",
             "a:has-text('Start Application')",
@@ -4682,10 +4894,14 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                                     "button:has-text('Apply Manually')",
                                     "[data-automation-id='autofillWithResume']",
                                     "a:has-text('Autofill with Resume')",
-                                    "button:has-text('Autofill with Resume')"
+                                    "button:has-text('Autofill with Resume')",
+                                    "a:has-text('Apply Now'):not([id*='filter'])",
+                                    "button:has-text('Apply Now'):not([id*='filter']):not(.dropdown-toggle)",
+                                    "a:has-text('Apply'):not([id*='filter'])",
+                                    "button:has-text('Apply'):not([id*='filter']):not(.dropdown-toggle)"
                                 ]:
                                     try:
-                                        man_btn = f.locator(man_sel).first
+                                        man_btn = f.locator(man_sel).last
                                         if await man_btn.is_visible():
                                             await man_btn.click(timeout=3000)
                                             job_logger.info(f"Clicked intermediate modal action: {man_sel}")
