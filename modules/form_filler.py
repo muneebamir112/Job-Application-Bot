@@ -1240,7 +1240,11 @@ EXPIRED_JOB_PATTERNS = [
     "this job requisition is no longer available",
     "no open positions found",
     "session has expired",
-    "page has expired"
+    "page has expired",
+    "job is no longer open",
+    "role is no longer open",
+    "requested job could not be found",
+    "either does not exist or is no longer open"
 ]
 
 async def detect_expired_or_missing_job(p_page, initial_job_link: str = "") -> tuple[bool, str]:
@@ -1271,11 +1275,15 @@ async def detect_expired_or_missing_job(p_page, initial_job_link: str = "") -> t
         pass
 
     try:
-        # Check main frame text and headings
-        body_text = (await p_page.inner_text("body")).lower()
-        for pat in EXPIRED_JOB_PATTERNS:
-            if pat in body_text:
-                return True, f"Job closure/expired notice detected: '{pat}'"
+        # Check all frames text and headings
+        for frame in p_page.frames:
+            try:
+                body_text = (await frame.inner_text("body")).lower()
+                for pat in EXPIRED_JOB_PATTERNS:
+                    if pat in body_text:
+                        return True, f"Job closure/expired notice detected in frame: '{pat}'"
+            except Exception:
+                continue
     except Exception:
         pass
 
@@ -2789,6 +2797,26 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
                 is_iti = False
             
             if is_iti:
+                try:
+                    # Open the flag dropdown
+                    await elem.evaluate("""el => {
+                        const iti = el.closest('.iti');
+                        if (iti) {
+                            const flagBtn = iti.querySelector('.iti__selected-flag');
+                            if (flagBtn) { flagBtn.click(); }
+                        }
+                    }""")
+                    import asyncio
+                    await asyncio.sleep(0.3)
+                    # The dropdown might be appended to the body, so we query from the frame
+                    us_opt = await frame.query_selector("li.iti__country[data-country-code='us']")
+                    if not us_opt:
+                        us_opt = await frame.query_selector("li[data-country-code='us']")
+                    if us_opt:
+                        await us_opt.click()
+                except Exception as e:
+                    job_logger.warning(f"Could not select US flag for phone input: {e}")
+                
                 # Strip leading +1 or other dial codes so only the national number is typed
                 cleaned_phone = re.sub(r"^\+1\s*", "", str(value).strip())
                 cleaned_phone = re.sub(r"^\+[\d]{1,3}\s*", "", cleaned_phone)
@@ -4717,25 +4745,6 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
         block_status, block_reason = await detect_captcha_or_login_wall(page)
         if block_status:
             return block_status, block_reason
-
-        is_closed = await page.evaluate("""() => {
-            const text = document.body.innerText.toLowerCase();
-            const closedPhrases = [
-                'job is no longer available',
-                'job is no longer open',
-                'this position has been closed',
-                'not accepting applications',
-                'job has expired',
-                'role is no longer open'
-            ];
-            for (const p of closedPhrases) {
-                if (text.includes(p)) return true;
-            }
-            return false;
-        }""")
-        if is_closed:
-            job_logger.warning("Job appears to be closed/expired.")
-            return "Failed", "Job is no longer open / expired."
 
         p_page = _get_raw_playwright_page(page)
 
