@@ -7,7 +7,7 @@ from datetime import datetime
 from playwright.async_api import Page, ElementHandle
 import config
 from modules.logger import logger
-from modules.ollama_client import query_ollama
+from modules.ollama_client import query_ollama, chat_ollama
 from modules.captcha_detector import detect_captcha_or_login_wall
 from modules.text_utils import strip_markdown_formatting
 import sys
@@ -1051,40 +1051,27 @@ Write plain prose only - act as {profile_name}, no markdown formatting of any ki
 async def ask_ollama_choice(label: str, options: list[str], profile: dict, job_logger, classification: str) -> str:
     """Ollama is given the list of rendered options and must pick one."""
     assert classification == "CHOICE_FIELD", "Ollama choice picker may only run for CHOICE_FIELD"
-    profile_context = json_context_string(profile)
-    resume_text = (profile.get("resume_text") or "")[:4000]
     options_str = str(options)
+    chat_history = profile.get("_chat_history", [])
 
-    system_prompt = (
-        "You are the candidate applying for this job. The Candidate Profile and Resume provided are YOUR personal background and YOUR identity. "
-        "Output ONLY the exact text of the option that best matches the question/context based on your identity and background. "
-        "NEVER refer to 'the candidate', 'the profile', or yourself as an AI. "
-        "CRITICAL INSTRUCTION FOR SALARY: If a question asks whether a target salary range meets your requirements or expectations, "
-        "and your profile's expected salary is LESS THAN or WITHIN that range, you MUST select 'Yes'. "
-        "CRITICAL INSTRUCTION FOR SKILLS/TOOLS: If a question asks about your years of experience or proficiency with a specific tool, technology, or skill (e.g., Unreal Engine, C++, Golang) "
-        "and that specific tool is NOT explicitly mentioned in your Profile's skills list (ignore the Resume summary for this check), you MUST strictly select the option indicating '0 years', 'None', or 'No experience'. "
-        "DO NOT extrapolate. DO NOT assume you have experience with it just because you have 8+ years of general software engineering experience. If the keyword is missing from your skills list, your experience is strictly 0. "
-        "CRITICAL INSTRUCTION FOR AFFILIATIONS/HISTORY: If a question asks if you have previously worked for the company, have family members at the company, are a member of a specific tribe/nation (e.g., Seneca Nation), or have worked for the Federal/State Government, you MUST strictly select 'No'. "
-        "If a question asks for a preference or something not explicitly stated, use your professional judgment to deduce a reasonable answer as if you were this person. "
-        "Do not include markdown or explanations. Output the exact option text only."
-    )
     prompt = f"""
-Your Profile:
-{profile_context}
-
-Your Resume summary:
-{resume_text}
-
 Question:
 {label}
 
 Options:
 {options_str}
 
-Choose the single best matching option. Your response MUST be exactly one of the options from the list above:
+CRITICAL INSTRUCTION FOR SALARY: If the expected salary in the profile is LESS THAN or WITHIN the target salary range, you MUST select 'Yes'.
+CRITICAL INSTRUCTION FOR SKILLS/TOOLS: If a specific tool/technology is NOT explicitly mentioned in the profile skills list, select '0 years', 'None', or 'No experience'.
+CRITICAL INSTRUCTION FOR AFFILIATIONS/HISTORY: Always answer 'No' for prior employment with company, family at company, or government work unless explicitly stated.
+
+Choose the single best matching option. Your response MUST be exactly one of the options from the list above. Do not include markdown or explanations. Output the exact option text only:
 """
     try:
-        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
+        current_messages = chat_history + [{"role": "user", "content": prompt}]
+        raw_answer = chat_ollama(current_messages, timeout=config.OLLAMA_LONG_TIMEOUT)
+        chat_history.append({"role": "user", "content": prompt})
+        chat_history.append({"role": "assistant", "content": raw_answer})
     except Exception as e:
         job_logger.warning(f"Ollama choice call for '{label}' failed or timed out: {e}. Falling back to default option.")
         # Return first non-placeholder option, not blindly options[0]
@@ -1121,24 +1108,20 @@ Choose the single best matching option. Your response MUST be exactly one of the
 
 async def ask_ollama_numeric(label: str, profile: dict, job_logger) -> str:
     """Prompt Ollama specifically to output a single numeric integer/decimal."""
-    profile_context = json_context_string(profile)
-    system_prompt = (
-        "You are the candidate applying for this job. The Candidate Profile provided is YOUR personal background and YOUR identity. "
-        "The form field requires a purely numeric answer (e.g. number of years, salary number, GPA, percentage). "
-        "Output ONLY digits (and a decimal point if applicable). Do NOT include words, currency signs, commas, or explanations. "
-        "For example, output '130000' or '8', never '$130,000' or '8 years'."
-    )
+    chat_history = profile.get("_chat_history", [])
     prompt = f"""
-Your Profile:
-{profile_context}
-
 Question:
 {label}
 
+The form field requires a purely numeric answer (e.g. number of years, salary number, GPA, percentage). 
+Output ONLY digits (and a decimal point if applicable). Do NOT include words, currency signs, commas, or explanations. For example, output '130000' or '8', never '$130,000' or '8 years'.
 Provide the numeric value only:
 """
     try:
-        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
+        current_messages = chat_history + [{"role": "user", "content": prompt}]
+        raw_answer = chat_ollama(current_messages, timeout=config.OLLAMA_LONG_TIMEOUT)
+        chat_history.append({"role": "user", "content": prompt})
+        chat_history.append({"role": "assistant", "content": raw_answer})
     except Exception as e:
         job_logger.warning(f"Ollama numeric call for '{label}' failed: {e}. Using fallback 5.")
         raw_answer = "5"
@@ -4712,6 +4695,16 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
     "Human Attention", or "Dry Run" (only when dry_run=True).
     """
     field_attempts = {}
+    
+    # Initialize stateful Ollama chat session for this job
+    profile_context = json_context_string(profile)
+    resume_text = (profile.get("resume_text") or "")[:4000]
+    profile["_chat_history"] = [
+        {"role": "system", "content": "You are the candidate applying for this job. Answer questions accurately based on the provided profile. Output exact matches for options. NEVER refer to 'the candidate' or yourself as an AI."},
+        {"role": "user", "content": f"Here is my Profile and Resume. Acknowledge this context.\n\nProfile: {profile_context}\nResume: {resume_text}"},
+        {"role": "assistant", "content": "I have received and understood the profile and resume. I am ready to answer questions as this candidate."}
+    ]
+
     try:
         # Step 1: Navigated page captcha/login check
         block_status, block_reason = await detect_captcha_or_login_wall(page)
