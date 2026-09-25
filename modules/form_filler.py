@@ -185,7 +185,7 @@ def find_profile_synonym_match(label: str) -> str | None:
         if is_open_ended_prompt and key in (
             "state", "country", "location", "first_name", "last_name", "middle_name",
             "full_name", "phone", "email", "gender", "race", "notice_period", "willing_to_relocate",
-            "facebook", "twitter", "instagram", "youtube", "github"
+            "facebook", "twitter", "instagram", "youtube", "github", "salary_expectation", "years_experience"
         ):
             continue
 
@@ -204,7 +204,7 @@ def find_profile_synonym_match(label: str) -> str | None:
                 # If a single-word keyword appears inside a long question (> 4 words), ignore it unless it's a known multi-word phrase
                 if len(kw_norm.split()) == 1 and len(words) > 4 and key in (
                     "state", "country", "location", "notice_period", "willing_to_relocate", "gender", "race",
-                    "facebook", "twitter", "instagram", "youtube", "github"
+                    "facebook", "twitter", "instagram", "youtube", "github", "salary_expectation", "years_experience"
                 ):
                     continue
                 return key
@@ -1697,11 +1697,13 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
     value = get_profile_value(profile, matched_key) if matched_key else None
     if not value and (matched_key in ("country_code", "phone_country_code") or any(kw in label.lower() for kw in ("country code", "phone code", "dialing code"))):
         value = "United States"
-    is_location = matched_key in ("location", "city") or any(kw in label.lower() for kw in ("location", "city", "where are you based", "currently based", "residence")) or ("where are you" in label.lower() and "based" in label.lower())
+        
+    is_location = matched_key in ("location", "city", "country", "state") or any(kw in label.lower() for kw in ("location", "city", "where are you based", "currently based", "residence", "country", "state")) or ("where are you" in label.lower() and "based" in label.lower())
+    
     # Fallback: if we know this is a location field but classify_field didn't match
     # a profile key, pull the location value from the profile directly.
     if is_location and not value:
-        value = profile.get("location") or profile.get("city") or ""
+        value = profile.get("location") or profile.get("city") or "United States"
         
     # Provide a typeable "No" for Hispanic/Latino comboboxes that require typing to open
     if not value and matched_key is None and any(k in label.lower() for k in ("hispanic", "latino", "ethnicity")):
@@ -4307,9 +4309,11 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
                 const catalogKeywords = [
                     'search-jobs', 'search jobs', 'all departments', 'all job types',
                     'all locations', 'search by title', 'search by keyword', 'filter by',
-                    'select-search-input', 'search locations', 'jobs-filter', 'job-search'
+                    'select-search-input', 'search locations', 'jobs-filter', 'job-search',
+                    'skip to main content', 'search-input-txt', 'language'
                 ];
-                if (catalogKeywords.some(kw => name.includes(kw) || tid.includes(kw) || ph.includes(kw) || aria.includes(kw) || id.includes(kw))) {
+                const className = (el.className || '').toLowerCase();
+                if (catalogKeywords.some(kw => name.includes(kw) || tid.includes(kw) || ph.includes(kw) || aria.includes(kw) || id.includes(kw) || className.includes(kw) || (el.innerText || '').toLowerCase().includes(kw) || (el.value || '').toLowerCase().includes(kw))) {
                     return true;
                 }
                 return false;
@@ -5104,6 +5108,17 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                         if block_status:
                             job_logger.info(f"Detected {block_status} while waiting for form fields: {block_reason}")
                             return block_status, block_reason
+
+                        # Check for Taleo "I Accept" or similar privacy agreements
+                        try:
+                            accept_btn = await p_page.query_selector('input[value="I Accept"], a:has-text("I Accept"), button:has-text("I Accept")')
+                            if accept_btn and await accept_btn.is_visible():
+                                job_logger.info("Found an 'I Accept' terms/privacy button. Clicking it...")
+                                await accept_btn.click(force=True)
+                                await asyncio.sleep(3)
+                                continue
+                        except Exception:
+                            pass
 
                         # Check if a new tab opened during the wait
                         try:
