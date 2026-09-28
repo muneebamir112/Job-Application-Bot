@@ -4808,9 +4808,24 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
             "input[value='Apply']",
             "a.btn-apply",
             "a.apply-job-btn",
-            "button:has-text('Apply'):not([id*='filter']):not([class*='ot-'])",
-            "a:has-text('Apply'):not([id*='filter']):not([class*='ot-'])"
+            "button:has-text('Apply'):not([id*='filter']):not([id*='onetrust']):not([class*='onetrust'])",
+            "a:has-text('Apply'):not([id*='filter']):not([id*='onetrust']):not([class*='onetrust'])"
         ]
+        
+        # Give SPAs time to render the Apply button (poll up to 15 seconds)
+        for _ in range(15):
+            any_visible = False
+            for f in p_page.frames:
+                if is_chat_frame(f): continue
+                for sel in apply_selectors:
+                    try:
+                        if await f.locator(sel).first.is_visible():
+                            any_visible = True
+                            break
+                    except Exception: pass
+                if any_visible: break
+            if any_visible: break
+            await asyncio.sleep(1.0)
         
         clicked_initial_apply = False
         for f in p_page.frames:
@@ -4897,6 +4912,8 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
 
                         await wait_for_fields_to_settle(p_page.main_frame, timeout_ms=8000)
 
+                        await asyncio.sleep(2.0)
+                        
                         # Handle intermediate modal like "Start Your Application" (Apply Manually / Autofill with Resume)
                         for _ in range(4):
                             clicked_modal = False
@@ -4909,12 +4926,10 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                                     "a:has-text('Autofill with Resume')",
                                     "button:has-text('Autofill with Resume')",
                                     "a:has-text('Apply Now'):not([id*='filter'])",
-                                    "button:has-text('Apply Now'):not([id*='filter']):not(.dropdown-toggle)",
-                                    "a:has-text('Apply'):not([id*='filter'])",
-                                    "button:has-text('Apply'):not([id*='filter']):not(.dropdown-toggle)"
+                                    "button:has-text('Apply Now'):not([id*='filter']):not(.dropdown-toggle)"
                                 ]:
                                     try:
-                                        man_btn = f.locator(man_sel).last
+                                        man_btn = f.locator(man_sel).first
                                         if await man_btn.is_visible():
                                             await man_btn.click(timeout=3000)
                                             job_logger.info(f"Clicked intermediate modal action: {man_sel}")
@@ -5063,6 +5078,37 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                                         page.page = _late_popup
 
                                 await wait_for_fields_to_settle(p_page.main_frame, timeout_ms=10000)
+
+                                await asyncio.sleep(2.0)
+                                for _ in range(4):
+                                    clicked_modal = False
+                                    for mf in p_page.frames:
+                                        for man_sel in [
+                                            "[data-automation-id='applyManually']",
+                                            "a:has-text('Apply Manually')",
+                                            "button:has-text('Apply Manually')",
+                                            "[data-automation-id='autofillWithResume']",
+                                            "a:has-text('Autofill with Resume')",
+                                            "button:has-text('Autofill with Resume')",
+                                            "a:has-text('Apply Now'):not([id*='filter'])",
+                                            "button:has-text('Apply Now'):not([id*='filter']):not(.dropdown-toggle)"
+                                        ]:
+                                            try:
+                                                man_btn = mf.locator(man_sel).first
+                                                if await man_btn.is_visible():
+                                                    await man_btn.click(timeout=3000)
+                                                    job_logger.info(f"Clicked intermediate modal action (late): {man_sel}")
+                                                    clicked_modal = True
+                                                    await wait_for_fields_to_settle(p_page.main_frame, timeout_ms=5000)
+                                                    break
+                                            except Exception:
+                                                pass
+                                        if clicked_modal:
+                                            break
+                                    if clicked_modal:
+                                        break
+                                    await asyncio.sleep(1)
+
                                 break
                         except Exception:
                             continue
