@@ -26,6 +26,7 @@ HEADLESS = os.getenv("HEADLESS", "False").lower() in ("true", "1", "yes")
 STEALTH_MODE = os.getenv("STEALTH_MODE", "True").lower() in ("true", "1", "yes")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 # Screenshot is taken only at the moment a submission is actually confirmed
+FILL_REQUIRED_ONLY = os.getenv("FILL_REQUIRED_ONLY", "False").lower() in ("true", "1", "yes")
 # successful (see form_filler.fill_and_submit_form) - not before submitting,
 # and never for a Failed/Human Attention/Dry Run outcome.
 SCREENSHOT_ON_SUCCESS = os.getenv("SCREENSHOT_ON_SUCCESS", "True").lower() in ("true", "1", "yes")

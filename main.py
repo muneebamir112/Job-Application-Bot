@@ -290,8 +290,11 @@ def main():
     parser.add_argument("--retry-human-attention", action="store_true", help="Retry applications with 'Human Attention' status")
     parser.add_argument("--dry-run", action="store_true", help="Fill out forms but stop before the final submit click; never updates the sheet")
     parser.add_argument("--num-profiles", type=int, default=0, help="Number of profiles to apply for. If 0, apply for all profiles.")
+    parser.add_argument("--fill-required-only", action="store_true", help="Only fill compulsory fields and ignore optional fields.")
     args = parser.parse_args()
-
+    
+    import config
+    config.FILL_REQUIRED_ONLY = args.fill_required_only
     asyncio.run(run_bot(
         retry_failed=args.retry_failed,
         retry_human_attention=args.retry_human_attention,

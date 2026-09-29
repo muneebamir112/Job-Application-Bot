@@ -182,7 +182,7 @@ class SheetSync:
         ollama_answers: list of dicts with keys: system_prompt, question, answer
         """
         ANSWERS_SHEET_NAME = "Sheet3"
-        HEADERS = ["Profile Name", "System Prompt", "Question", "Answer"]
+        HEADERS = ["profile name", "question with prompt", "question", "answer"]
 
         if not ollama_answers:
             return
@@ -204,7 +204,7 @@ class SheetSync:
                     answer = answer[:3997] + "..."
                 rows.append([
                     profile_name,
-                    qa.get("system_prompt", ""),
+                    qa.get("question_with_prompt", qa.get("system_prompt", "")),
                     qa.get("question", ""),
                     answer,
                 ])

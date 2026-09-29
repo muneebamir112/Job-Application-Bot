@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime
 from playwright.async_api import Page, ElementHandle
 import config
+from modules.ollama_session import OllamaJobSession
 from modules.logger import logger
 from modules.ollama_client import query_ollama
 from modules.captcha_detector import detect_captcha_or_login_wall
@@ -960,65 +961,17 @@ def json_context_string(profile: dict) -> str:
 async def ask_ollama_open_ended(label: str, profile: dict, job_logger, classification: str) -> str:
     """The only call site allowed to generate a free-text Ollama answer for a form field."""
     assert classification == "OPEN_ENDED", "Ollama may only produce free text for OPEN_ENDED fields"
-
-    profile_context = json_context_string(profile)
-    # Use larger resume context (~4000 chars) to ensure experience/skills aren't truncated
-    resume_text = (profile.get("resume_text") or "")[:4000]
-    job_title = profile.get("job_title") or "the role"
-    company_name = profile.get("company_name") or "the company"
-    profile_name = profile.get("name") or profile.get("full_name") or "the candidate"
-    system_prompt = (
-        "You are the candidate applying for this job. "
-        "The Candidate Profile and Resume provided are YOUR personal background, YOUR experience, and YOUR identity. "
-        "You MUST answer the question in the first person ('I', 'my', 'me'). "
-        "NEVER refer to 'the candidate', 'the profile', 'the resume', or yourself as an AI. "
-        "If a question asks for something not explicitly stated in your background, use your intelligence and professional judgment to deduce a reasonable, realistic answer as if you were this person. "
-        "IMPORTANT: Only reply with EXACTLY 'N/A' if the question asks for a specific factual URL or account link (like a Twitter/GitHub URL) that is completely missing from the profile. "
-        "For ALL other questions — including subjective, experience-based, preference, or opinion questions — you MUST write a proper first-person answer. NEVER reply N/A to those. "
-        "Keep your answer concise, professional, and specific (2-3 sentences). "
-        "This answer is typed directly into a plain-text form field, so write in plain prose only: "
-        "no markdown, no **bold**, no headers, no bullet points, or asterisks. "
-        f"You are applying for the '{job_title}' position at '{company_name}'. If the question or answer "
-        "references the role or company, use those exact names. Never output placeholder text like [Company]."
-    )
-    prompt = f"""
-Job title you are applying for: {job_title}
-Company you are applying to: {company_name}
-
-Your Profile context:
-{profile_context}
-
-Your Resume summary:
-{resume_text}
-
-Question:
-{label}
-
-Answer the question professionally, concisely, and specifically, using only the facts above as YOUR own background.
-If you reference the role or company, use the exact job title and company name given above -
-never leave placeholder brackets like [Position Title] or [Company Name] in the answer.
-Remember: You MUST answer in the first person ('I') and NEVER mention that you are an AI or reading from a profile.
-Write plain prose only - act as {profile_name}, no markdown formatting of any kind:
-"""
-    job_logger.info(f"Open-ended field detected: '{label}'. Querying Ollama...")
-    try:
-        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
-    except Exception as e:
-        job_logger.warning(f"Ollama call for '{label}' failed or timed out: {e}. Using intelligent fallback.")
-        label_lower = label.lower()
-        if any(kw in label_lower for kw in ("mission", "inspire", "why do you want", "why join", "interest")):
-            raw_answer = f"I am truly inspired by {company_name}'s mission, innovative culture, and technological vision. My background and skills align closely with this role, and I am excited about the opportunity to contribute directly to the team's ongoing success."
-        elif any(kw in label_lower for kw in ("experience", "project", "accomplishment", "background")):
-            raw_answer = f"Throughout my career, I have developed robust, scalable solutions using modern technologies and best engineering practices. I thrive in collaborative environments and consistently deliver high-impact results."
-        elif any(kw in label_lower for kw in ("how did you hear", "hear about", "referral", "source")):
-            raw_answer = "I found this role through LinkedIn while researching opportunities in this space."
-        else:
-            raw_answer = f"I am very interested in this {job_title} role at {company_name} and look forward to contributing my technical expertise and problem-solving abilities to your team."
-
-    cleaned = strip_markdown_formatting(raw_answer).strip()
+    
+    if hasattr(job_logger, "ollama_session"):
+        cleaned = await job_logger.ollama_session.ask_open_ended(label, job_logger)
+    else:
+        # Fallback if somehow not initialized
+        cleaned = "N/A"
 
     # If Ollama returned empty, whitespace, or an incomplete stub, trigger intelligent domain fallback
     if not cleaned or len(cleaned) < 10:
+        company_name = profile.get("company_name", "the company")
+        job_title = profile.get("job_title", "the role")
         label_lower = label.lower()
         if any(kw in label_lower for kw in ("mission", "inspire", "why do you want", "why join", "interest")):
             cleaned = f"I am truly inspired by {company_name}'s mission, innovative culture, and technological vision. My background and skills align closely with this role, and I am excited about the opportunity to contribute directly to the team's ongoing success."
@@ -1028,9 +981,6 @@ Write plain prose only - act as {profile_name}, no markdown formatting of any ki
             cleaned = "I found this role through LinkedIn while researching opportunities in this space."
         else:
             cleaned = f"I am very interested in this {job_title} role at {company_name} and look forward to contributing my technical expertise and problem-solving abilities to your team."
-
-    job_logger.info(f"--- OLLAMA PROMPT FOR '{label}' ---\nSystem: {system_prompt}\nUser: {prompt}\n----------------------------------")
-    job_logger.info(f"--- OLLAMA RESPONSE FOR '{label}' ---\nRaw: {raw_answer}\nCleaned: {cleaned}\n------------------------------------")
 
     # If the question is about referral / discovery source, never return N/A
     label_lower = label.lower()
@@ -1043,6 +993,8 @@ Write plain prose only - act as {profile_name}, no markdown formatting of any ki
         is_url = any(kw in label_lower for kw in ("url", "link", "http", "website", "portfolio", "github", "twitter", "blog"))
         if is_url:
             return "N/A"
+        job_title = profile.get("job_title", "the role")
+        company_name = profile.get("company_name", "the company")
         return f"I am excited about the {job_title} opportunity at {company_name} and look forward to contributing my technical skills and experience to the team."
 
     return cleaned
@@ -1051,55 +1003,18 @@ Write plain prose only - act as {profile_name}, no markdown formatting of any ki
 async def ask_ollama_choice(label: str, options: list[str], profile: dict, job_logger, classification: str) -> str:
     """Ollama is given the list of rendered options and must pick one."""
     assert classification == "CHOICE_FIELD", "Ollama choice picker may only run for CHOICE_FIELD"
-    profile_context = json_context_string(profile)
-    resume_text = (profile.get("resume_text") or "")[:4000]
-    options_str = str(options)
-
-    system_prompt = (
-        "You are the candidate applying for this job. The Candidate Profile and Resume provided are YOUR personal background and YOUR identity. "
-        "Output ONLY the exact text of the option that best matches the question/context based on your identity and background. "
-        "NEVER refer to 'the candidate', 'the profile', or yourself as an AI. "
-        "CRITICAL INSTRUCTION FOR SALARY: If a question asks whether a target salary range meets your requirements or expectations, "
-        "and your profile's expected salary is LESS THAN or WITHIN that range, you MUST select 'Yes'. "
-        "CRITICAL INSTRUCTION FOR SKILLS/TOOLS: If a question asks about your years of experience or proficiency with a specific tool, technology, or skill (e.g., Unreal Engine, C++, Golang) "
-        "and that specific tool is NOT explicitly mentioned in your Profile's skills list (ignore the Resume summary for this check), you MUST strictly select the option indicating '0 years', 'None', or 'No experience'. "
-        "DO NOT extrapolate. DO NOT assume you have experience with it just because you have 8+ years of general software engineering experience. If the keyword is missing from your skills list, your experience is strictly 0. "
-        "CRITICAL INSTRUCTION FOR AFFILIATIONS/HISTORY: If a question asks if you have previously worked for the company, have family members at the company, are a member of a specific tribe/nation (e.g., Seneca Nation), or have worked for the Federal/State Government, you MUST strictly select 'No'. "
-        "If a question asks for a preference or something not explicitly stated, use your professional judgment to deduce a reasonable answer as if you were this person. "
-        "Do not include markdown or explanations. Output the exact option text only."
-    )
-    prompt = f"""
-Your Profile:
-{profile_context}
-
-Your Resume summary:
-{resume_text}
-
-Question:
-{label}
-
-Options:
-{options_str}
-
-Choose the single best matching option. Your response MUST be exactly one of the options from the list above:
-"""
-    try:
-        raw_answer = query_ollama(prompt, system_prompt=system_prompt, timeout=config.OLLAMA_LONG_TIMEOUT)
-    except Exception as e:
-        job_logger.warning(f"Ollama choice call for '{label}' failed or timed out: {e}. Falling back to default option.")
-        # Return first non-placeholder option, not blindly options[0]
+    
+    if hasattr(job_logger, "ollama_session"):
+        cleaned = await job_logger.ollama_session.ask_choice(label, options, job_logger)
+    else:
+        # Fallback if not initialized
         for opt in options:
             if normalize_text(opt) not in _SELECT_PLACEHOLDER_TEXTS:
                 return opt
         return options[0] if options else ""
 
-    cleaned = strip_markdown_formatting(raw_answer).strip()
-
     # If Ollama wrapped the answer in quotes or brackets, strip them
     cleaned = re.sub(r"^['\"\[]+|['\"\]]+$", "", cleaned).strip()
-
-    job_logger.info(f"--- OLLAMA PROMPT FOR '{label}' ---\nSystem: {system_prompt}\nUser: {prompt}\n----------------------------------")
-    job_logger.info(f"--- OLLAMA RESPONSE FOR '{label}' ---\n{raw_answer}\n------------------------------------")
 
     # Re-match against actual options to guarantee exact match
     for opt in options:
@@ -2662,10 +2577,36 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
 # Field fillers
 # ---------------------------------------------------------------------------
 
+async def _should_skip_optional(elem, label: str, job_logger) -> bool:
+    if not config.FILL_REQUIRED_ONLY:
+        return False
+    label_norm = (label or "").lower()
+    is_req = "*" in label or "required" in label_norm
+    if not is_req and elem:
+        try:
+            is_req = await elem.evaluate("""el => {
+                let isReq = el.required || el.getAttribute('required') !== null || el.getAttribute('aria-required') === 'true' || el.getAttribute('aria-invalid') === 'true';
+                if (!isReq) {
+                    let parent = el.closest('.required, [class*="required"], [class*="error"], [class*="invalid"], [aria-invalid="true"], [aria-required="true"]');
+                    if (parent) isReq = true;
+                }
+                return isReq;
+            }""")
+        except Exception:
+            pass
+    if not is_req:
+        job_logger.info(f"Skipping optional field '{label}' (FILL_REQUIRED_ONLY=True)")
+        return True
+    return False
+# ---------------------------------------------------------------------------
+
 async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
     """Fills a text input, textarea, or contenteditable element."""
     if not label or not label.strip():
         return False
+        
+    if await _should_skip_optional(elem, label, job_logger):
+        return True
     
     if label.strip().lower() == "search":
         return True
@@ -2949,6 +2890,9 @@ async def fill_select_field(elem: ElementHandle, label: str, profile: dict, job_
     """Fills a native <select> dropdown by choosing an existing option."""
     if not label or not label.strip():
         return False
+
+    if await _should_skip_optional(elem, label, job_logger):
+        return True
 
     existing_value = await read_element_value(elem)
     # Only treat as already-filled if the value is NOT a placeholder text
@@ -3416,6 +3360,9 @@ async def fill_radio_group(frame, name_attr: str, label: str, profile: dict, job
     """Fills a group of native radio buttons with the same name attribute."""
     try:
         radios = await frame.query_selector_all(f"input[type='radio'][name='{name_attr}']")
+        if radios and await _should_skip_optional(radios[0], label, job_logger):
+            return True
+        radios = await frame.query_selector_all(f"input[type='radio'][name='{name_attr}']")
         radio_options = []
         for r in radios:
             r_id = await r.get_attribute("id")
@@ -3487,6 +3434,8 @@ async def fill_radio_group(frame, name_attr: str, label: str, profile: dict, job
 
 async def fill_aria_radio_group(frame, group_elem: ElementHandle, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
     """Fills an ARIA [role=radiogroup] or custom radiogroup component (e.g. spl-radio-group) made of [role=radio] or <spl-radio> children."""
+    if await _should_skip_optional(group_elem, label, job_logger):
+        return True
     try:
         # Query both standard [role='radio'] and custom elements like spl-radio
         radios = await group_elem.query_selector_all("[role='radio'], spl-radio")
@@ -3635,31 +3584,13 @@ async def _resolve_checkbox_state(label: str, profile: dict, job_logger) -> tupl
         if any(s == label_norm or (len(s) > 2 and s in label_norm) or (len(label_norm) > 2 and label_norm in s) for s in candidate_skills):
             return True, "profile.json (skills match)"
 
-        resume_text = (profile.get("resume_text") or "")[:4000]
-
         # No usable profile-derived yes/no signal for this checkbox - fall back
         # to Ollama deciding check/uncheck (still not free text, just a binary state)
-        system_prompt = (
-            "You are a job application bot evaluating a single checkbox option. Return 'yes' if the checkbox should be checked or 'no' if not. Be concise. "
-            "CRITICAL INSTRUCTION FOR SKILLS/TOOLS: If the checkbox label is a specific tool, technology, or skill (e.g., Unreal Engine, C++, Golang) "
-            "and that specific tool is NOT explicitly mentioned in the Candidate profile details skills list (ignore the Resume summary for this check), you MUST strictly answer 'no'. "
-            "DO NOT extrapolate. DO NOT assume the candidate has experience with it just because they have general software engineering experience. If the keyword is missing from the skills list, the answer is 'no'. "
-            "CRITICAL INSTRUCTION FOR AFFILIATIONS/HISTORY: If the checkbox label asks if you have previously worked for the company, have family members at the company, are a member of a specific tribe/nation (e.g., Seneca Nation), or have worked for the Federal/State Government, you MUST strictly answer 'no'."
-        )
-        prompt = f"""
-Candidate profile details:
-{json_context_string(profile)}
-
-Your Resume summary:
-{resume_text}
-
-Checkbox Label:
-{label}
-
-Should the candidate check/agree to this checkbox? (Answer 'yes' or 'no' only):
-"""
-        answer = query_ollama(prompt, system_prompt=system_prompt).lower()
-        should_check = "yes" in answer
+        if hasattr(job_logger, "ollama_session"):
+            answer = await job_logger.ollama_session.ask_choice(f"Should I check this checkbox? Label: {label}", ["Yes", "No"], job_logger)
+            should_check = "yes" in answer.lower()
+        else:
+            should_check = False
         source = "ollama"
 
     return should_check, source
@@ -3667,6 +3598,8 @@ Should the candidate check/agree to this checkbox? (Answer 'yes' or 'no' only):
 
 async def fill_checkbox(elem: ElementHandle, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
     """Handles a native <input type=checkbox> (e.g. Terms, equal opportunity, relocation, etc.)."""
+    if await _should_skip_optional(elem, label, job_logger):
+        return True
     try:
         classification, _ = classify_field(label, "checkbox", profile)
         should_check, source = await _resolve_checkbox_state(label, profile, job_logger)
@@ -3700,6 +3633,8 @@ async def fill_checkbox(elem: ElementHandle, label: str, profile: dict, job_logg
 
 async def fill_aria_checkbox(elem: ElementHandle, label: str, profile: dict, job_logger, field_attempts: dict = None) -> bool:
     """Handles a custom-widget [role=checkbox] element (toggled via click + aria-checked, not .check())."""
+    if await _should_skip_optional(elem, label, job_logger):
+        return True
     try:
         classification, _ = classify_field(label, "checkbox", profile)
         should_check, source = await _resolve_checkbox_state(label, profile, job_logger)
@@ -3825,6 +3760,14 @@ async def fill_yesno_buttons(frame, container: ElementHandle, label: str, profil
     recovery loop to redo the whole form, retry this one field directly by
     re-querying a fresh container by label on a stale-element failure.
     """
+    if not label or not label.strip():
+        return False
+
+    # NOTE: Never skip Yes/No button groups based on FILL_REQUIRED_ONLY.
+    # Ashby and similar ATS never expose aria-required on the button container,
+    # so _should_skip_optional always thinks they're optional — but the server
+    # marks ALL of them as required after submit. Always fill them.
+
     if await is_yesno_already_answered(container):
         return True
 
@@ -3852,7 +3795,8 @@ async def fill_yesno_buttons(frame, container: ElementHandle, label: str, profil
                 return False
 
             await target_btn.scroll_into_view_if_needed()
-            await target_btn.click()
+            await target_btn.click(force=True)
+            await asyncio.sleep(0.5)  # Wait for React state to update
             log_field_decision(job_logger, label, classification, source, "Yes" if should_check else "No")
             return True
         except Exception as e:
@@ -4743,6 +4687,8 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
     Returns (status, reason). status is one of "Submitted", "Failed",
     "Human Attention", or "Dry Run" (only when dry_run=True).
     """
+    resume_text = (profile.get("resume_text") or "")[:4000]
+    job_logger.ollama_session = OllamaJobSession(profile, resume_text, company, profile.get("job_title", "Unknown Role"))
     field_attempts = {}
     try:
         # Step 1: Navigated page captcha/login check
@@ -5443,12 +5389,17 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                     if has_errors:
                         job_logger.warning(f"Validation errors appeared after submit (attempt {submit_attempt}): {reasons}. Attempting to fill missing fields.")
                         resume_missing = any("resume" in r.lower() or "file upload" in r.lower() for r in reasons)
-                        await fill_aria_invalid_fields(frame, profile, job_logger, field_attempts=field_attempts)
-                        await process_form_fields(
-                            frame, profile, job_logger,
-                            resume_already_uploaded=(not resume_missing),
-                            field_attempts=field_attempts
-                        )
+                        original_fill_req = config.FILL_REQUIRED_ONLY
+                        config.FILL_REQUIRED_ONLY = False
+                        try:
+                            await fill_aria_invalid_fields(frame, profile, job_logger, field_attempts=field_attempts)
+                            await process_form_fields(
+                                frame, profile, job_logger,
+                                resume_already_uploaded=(not resume_missing),
+                                field_attempts=field_attempts
+                            )
+                        finally:
+                            config.FILL_REQUIRED_ONLY = original_fill_req
                         continue  # Loop back and try submitting again
 
                     job_logger.warning("Submit button was clicked but no confirmation (URL change or success message) was detected.")
@@ -5467,3 +5418,11 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
         tb = traceback.format_exc()
         job_logger.error(f"Exception occurred during form filling: {e}\nTraceback:\n{tb}")
         return "Failed", f"Exception: {e}"
+    finally:
+        if hasattr(job_logger, "ollama_session") and hasattr(job_logger, "handlers") and job_logger.handlers:
+            import os
+            try:
+                log_dir = os.path.dirname(job_logger.handlers[0].baseFilename)
+                job_logger.ollama_session.save_transcript(log_dir)
+            except Exception:
+                pass
