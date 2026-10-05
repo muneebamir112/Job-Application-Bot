@@ -45,13 +45,15 @@ LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 # in resume-bot/ollama_generate.py) - used to upload the resume tailored to
 # each specific job's company, instead of the single generic one in
 # RESUME_DIR (which is only used to build the base profile/answers).
-CVS_DIR = r"C:\Users\webNcodes\Desktop\CVs"
+import os
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CVS_DIR = os.path.join(BASE_DIR, "CVs")
 
 # Successful-application screenshots are saved to
 # SCREENSHOTS_DIR/<Company Name>/<screenshot>.png - a dedicated Desktop
 # folder rather than LOGS_DIR, since these are meant as user-facing proof of
 # each submitted application, not internal debug logs.
-SCREENSHOTS_DIR = r"C:\Users\webNcodes\Desktop\Job Application Screenshots"
+SCREENSHOTS_DIR = os.path.join(BASE_DIR, "Job Application Screenshots")
 
 # Ensure necessary directories exist
 os.makedirs(RESUME_DIR, exist_ok=True)

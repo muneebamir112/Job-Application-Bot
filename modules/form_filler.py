@@ -2161,12 +2161,17 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
                 return label_text.strip()
 
         # 3. Check custom element host or enclosing form element container (e.g. spl-checkbox, spl-input, spl-autocomplete, spl-form-element, spl-radio-group)
-        host_label = await element.evaluate("""el => {
+                host_label = await element.evaluate("""el => {
             let node = el;
             let hosts = [];
             while (node) {
-                if (node.tagName && (node.tagName.toLowerCase().startsWith('spl-') || node.className && typeof node.className === 'string' && (node.className.includes('form-group') || node.className.includes('field-wrapper')))) {
-                    if (!node.tagName.toLowerCase().includes('internal')) {
+                let tName = (node.tagName || "").toLowerCase();
+                let isInputNode = ['input', 'textarea', 'select', 'button'].includes(tName);
+                if (!isInputNode) {
+                    if (tName.startsWith('spl-') && !tName.includes('internal')) {
+                        hosts.push(node);
+                    }
+                    else if (node.className && typeof node.className === 'string' && (node.className.includes('form-group') || node.className.includes('field-wrapper') || node.className.includes('spl-') || node.className.includes('question'))) {
                         hosts.push(node);
                     }
                 }
@@ -2177,46 +2182,47 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
                 }
             }
             
-            // Search hosts from bottom-up (closest to element first)
             for (let h of hosts) {
                 let lbl = h.getAttribute('label') || h.getAttribute('aria-label') || '';
                 if (lbl && lbl.trim().length > 1) {
-                    let cleaned = lbl.trim().replace(/^Select /i, '').trim(); // SmartRecruiters often prefixes aria-labels with 'Select '
+                    let cleaned = lbl.trim().replace(/^Select /i, '').trim(); 
                     return cleaned;
                 }
                 
                 let slotLbl = h.querySelector('[slot="label-content"]');
                 if (slotLbl && slotLbl.innerText && slotLbl.innerText.trim()) {
                     let t = slotLbl.innerText.trim();
-                    if (t.replace(/[*:\\s]/g, '').length > 0) return t;
+                    if (t.replace(/[*:\s]/g, '').length > 0) return t;
                 }
                 
                 let realLabel = h.querySelector('label');
                 if (realLabel && realLabel.innerText && realLabel.innerText.trim()) {
                     let t = realLabel.innerText.trim();
-                    if (t.replace(/[*:\\s]/g, '').length > 0) return t;
+                    if (t.replace(/[*:\s]/g, '').length > 0) return t;
+                }
+                if (h.shadowRoot) {
+                    let shadowLbl = h.shadowRoot.querySelector('label, [class*="label"], [class*="title"], [class*="question"]');
+                    if (shadowLbl && shadowLbl.innerText && shadowLbl.innerText.trim()) {
+                        let t = shadowLbl.innerText.trim();
+                        if (t.replace(/[*:\s]/g, '').length > 0) return t;
+                    }
                 }
             }
             
-            // If no label found in hosts, check previous siblings of hosts
             for (let h of hosts) {
-                let prev = h.previousElementSibling;
-                while (prev) {
-                    let t = prev.innerText || prev.textContent || '';
-                    if (t.trim() && t.trim().length > 5) return t.trim();
-                    prev = prev.previousElementSibling;
-                }
-            }
-            
-            // Fallback to closest non-empty text content of the hosts
-            for (let h of hosts) {
-                let txt = h.innerText || h.textContent || '';
-                let lines = txt.split('\\n').map(l => l.trim());
+                let txt = h.innerText || h.textContent || (h.shadowRoot ? h.shadowRoot.textContent : '') || '';
+                let lines = txt.split('\n').map(l => l.trim());
                 for (let line of lines) {
-                    if (line.replace(/[*:\\s]/g, '').length > 0) return line;
+                    if (line.replace(/[*:\s]/g, '').length > 0) return line;
                 }
             }
-            return '';
+            
+            // IF we are here, we found nothing! Let's return a debug string!
+            let debugStr = "DEBUG_NO_LABEL: hosts=" + hosts.length;
+            for (let h of hosts) {
+                debugStr += " | " + (h.tagName || "") + " id=" + (h.id || "");
+            }
+            return debugStr;
         }""")
         if host_label and host_label.strip() and len(re.sub(r'[*:\s]', '', host_label.strip())) > 0:
             return host_label.strip()
@@ -2291,7 +2297,7 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
             return name_attr.strip()
 
     except Exception as e:
-        logger.debug(f"Error getting field label: {e}")
+        logger.warning(f"Error getting field label: {e}")
 
     return ""
 
@@ -2531,8 +2537,7 @@ async def set_field_value(elem: ElementHandle, value: str, frame=None, label: st
             pass
 
     try:
-        await target_elem.press("Control+a", timeout=1000)
-        await target_elem.press("Backspace", timeout=1000)
+        await target_elem.evaluate("el => { if (el.value !== undefined) el.value = ''; if (el.isContentEditable) el.innerText = ''; }")
     except Exception:
         pass
 
@@ -3105,9 +3110,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if normalize_text(opt_text) == CITIZENSHIP_ANSWER:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, f"hardcoded-rule (citizenship: {CITIZENSHIP_ANSWER})", opt_text
 
     if any(kw in label_norm for kw in LANGUAGE_LABEL_KEYWORDS):
@@ -3115,9 +3120,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if normalize_text(opt_text) == LANGUAGE_ANSWER:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, f"hardcoded-rule (language: {LANGUAGE_ANSWER})", opt_text
 
     if any(kw in label_norm for kw in GENDER_LABEL_KEYWORDS):
@@ -3125,9 +3130,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if normalize_text(opt_text) == GENDER_ANSWER:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, f"hardcoded-rule (gender: {GENDER_ANSWER})", opt_text
 
     if any(kw in label_norm for kw in VETERAN_LABEL_KEYWORDS) or any("protected veteran" in normalize_text(opt) for opt in options_texts):
@@ -3136,9 +3141,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                 if ans_kw in normalize_text(opt_text):
                     await elem.scroll_into_view_if_needed()
                     try:
-                        await elem.click()
+                        await elem.click(force=True)
                     except Exception:
-                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                        await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                     return True, "hardcoded-rule (veteran: decline)", opt_text
 
     if any(kw in label_norm for kw in DISABILITY_LABEL_KEYWORDS) or any("disability" in normalize_text(opt) for opt in options_texts):
@@ -3147,9 +3152,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                 if ans_kw in normalize_text(opt_text):
                     await elem.scroll_into_view_if_needed()
                     try:
-                        await elem.click()
+                        await elem.click(force=True)
                     except Exception:
-                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                        await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                     return True, "hardcoded-rule (disability: decline)", opt_text
 
     if any(kw in label_norm for kw in AGE_LABEL_KEYWORDS) or any("30 39" in normalize_text(opt) for opt in options_texts):
@@ -3157,9 +3162,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if AGE_ANSWER in normalize_text(opt_text) or "30 39" in normalize_text(opt_text):
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, f"hardcoded-rule (age: {AGE_ANSWER})", opt_text
 
     if any(kw in label_norm for kw in RACE_LABEL_KEYWORDS) or any("hispanic" in normalize_text(opt) for opt in options_texts):
@@ -3168,9 +3173,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                 if ans_kw in normalize_text(opt_text):
                     await elem.scroll_into_view_if_needed()
                     try:
-                        await elem.click()
+                        await elem.click(force=True)
                     except Exception:
-                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                        await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                     return True, "hardcoded-rule (race: decline)", opt_text
 
     if any(kw in label_norm for kw in ALWAYS_YES_LABEL_KEYWORDS):
@@ -3179,18 +3184,18 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if normalize_text(opt_text) in ("yes", "y", "true"):
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "hardcoded-rule (always yes)", opt_text
         # Fallback: click first option whose text starts with "yes"
         for elem, opt_text in options:
             if normalize_text(opt_text).startswith("yes"):
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "hardcoded-rule (always yes - prefix match)", opt_text
 
     if any(kw in label_norm for kw in ALWAYS_NO_LABEL_KEYWORDS):
@@ -3198,17 +3203,17 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if normalize_text(opt_text) in ("no", "n", "false"):
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "hardcoded-rule (always no)", opt_text
         for elem, opt_text in options:
             if normalize_text(opt_text).startswith("no"):
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "hardcoded-rule (always no - prefix match)", opt_text
 
     # Pronouns radio group: prefer He/Him, fallback to "Use name only"
@@ -3218,18 +3223,18 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                 if normalize_text(opt_text) in [normalize_text(preferred), preferred.replace("/", " ")]:
                     await elem.scroll_into_view_if_needed()
                     try:
-                        await elem.click()
+                        await elem.click(force=True)
                     except Exception:
-                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                        await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                     return True, "hardcoded-rule (pronouns: He/Him)", opt_text
         for fallback in PRONOUNS_FALLBACK:
             for elem, opt_text in options:
                 if normalize_text(fallback) in normalize_text(opt_text):
                     await elem.scroll_into_view_if_needed()
                     try:
-                        await elem.click()
+                        await elem.click(force=True)
                     except Exception:
-                        await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                        await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                     return True, "hardcoded-rule (pronouns: Use name only fallback)", opt_text
 
     if is_eeo_race_question(options_texts):
@@ -3241,9 +3246,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if "decline" in opt_norm and "self identify" in opt_norm:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "profile.json (race/ethnicity always declined)", opt_text
 
         category = resolve_eeo_race_category(profile.get("location") or "")
@@ -3254,9 +3259,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
                     if opt_text == best_text:
                         await elem.scroll_into_view_if_needed()
                         try:
-                            await elem.click()
+                            await elem.click(force=True)
                         except Exception:
-                            await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                            await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                         return True, f"profile.json (location-based race category: {category})", opt_text
 
     forced_choice = resolve_visa_sponsorship_choice(label_norm, options_texts, profile)
@@ -3265,9 +3270,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if opt_text == forced_choice:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "profile.json (visa sponsorship not needed -> legally authorized statement)", opt_text
 
     gender_id_choice = resolve_gender_identity_choice(label_norm, options_texts)
@@ -3276,9 +3281,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if opt_text == gender_id_choice:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "hardcoded-rule (gender identity)", opt_text
 
     hispanic_choice = resolve_hispanic_latino_choice(label_norm, options_texts)
@@ -3287,9 +3292,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if opt_text == hispanic_choice:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "hardcoded-rule (hispanic/latino: no)", opt_text
 
     eeo_race_choice = resolve_eeo_race_choice(label_norm, options_texts)
@@ -3298,9 +3303,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if opt_text == eeo_race_choice:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "hardcoded-rule (race: white/decline)", opt_text
 
     source_choice = resolve_hear_about_us_choice(label_norm, options_texts)
@@ -3309,9 +3314,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if opt_text == source_choice:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "hardcoded-rule (hear about us: job board/linkedin)", opt_text
 
     skill_choice = resolve_skills_experience_choice(label_norm, options_texts, profile)
@@ -3320,9 +3325,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
             if opt_text == skill_choice:
                 await elem.scroll_into_view_if_needed()
                 try:
-                    await elem.click()
+                    await elem.click(force=True)
                 except Exception:
-                    await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                    await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
                 return True, "profile.json (skills/resume match)", opt_text
 
     matched_key = find_profile_synonym_match(label)
@@ -3344,9 +3349,9 @@ async def _resolve_choice_and_click(options: list[tuple], label: str, profile: d
         if opt_text and (opt_text.lower() == selected_option_text.lower() or selected_option_text.lower() in opt_text.lower()):
             await elem.scroll_into_view_if_needed()
             try:
-                await elem.evaluate("""el => { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); }""")
+                await elem.evaluate("""el => { let lbl = el.closest('label'); if (!lbl && el.id) lbl = document.querySelector('label[for="' + el.id + '"]'); if (!lbl) lbl = el.nextElementSibling; if (lbl && lbl.tagName === 'LABEL') { lbl.click(); } else { el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true})); el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true})); el.click(); } }""")
             except Exception:
-                await elem.click()
+                await elem.click(force=True)
             return True, source, opt_text
 
     try:
@@ -3402,7 +3407,7 @@ async def fill_radio_group(frame, name_attr: str, label: str, profile: dict, job
                     if await r.is_checked():
                         return True
                     await r.scroll_into_view_if_needed()
-                    await r.click()
+                    await r.click(force=True)
                     log_field_decision(job_logger, label, "CHOICE_FIELD",
                         "profile.json (visa sponsorship not needed -> legally authorized statement, overriding page default)", forced_choice)
                     return True
@@ -3490,7 +3495,7 @@ async def fill_aria_radio_group(frame, group_elem: ElementHandle, label: str, pr
                     if is_checked:
                         return True
                     await r.scroll_into_view_if_needed()
-                    await r.click()
+                    await r.click(force=True)
                     log_field_decision(job_logger, label, "CHOICE_FIELD",
                         "profile.json (visa sponsorship not needed -> legally authorized statement, overriding page default)", forced_choice)
                     return True
@@ -3663,11 +3668,11 @@ async def fill_aria_checkbox(elem: ElementHandle, label: str, profile: dict, job
 
         if should_check and not current_state:
             await elem.scroll_into_view_if_needed()
-            await elem.click()
+            await elem.click(force=True)
         elif not should_check and current_state:
             # Explicitly uncheck (e.g. wrong pronoun was pre-selected)
             await elem.scroll_into_view_if_needed()
-            await elem.click()
+            await elem.click(force=True)
 
         log_field_decision(job_logger, label, classification, source, "checked" if should_check else "unchecked")
         return True
@@ -4163,8 +4168,7 @@ async def fill_aria_invalid_fields(frame, profile: dict, job_logger, field_attem
                             except Exception:
                                 pass
                         try:
-                            await elem.press("Control+a", timeout=1000)
-                            await elem.press("Backspace", timeout=1000)
+                            await elem.evaluate("el => { if (el.value !== undefined) el.value = ''; if (el.isContentEditable) el.innerText = ''; }")
                         except Exception:
                             pass
                         try:

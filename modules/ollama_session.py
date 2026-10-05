@@ -54,6 +54,10 @@ CRITICAL INSTRUCTION FOR OPEN-ENDED: When answering open-ended questions, always
 
 
     async def _chat_with_ollama(self, new_user_content: str, temperature: float = 0.1, num_predict: int = None) -> str:
+        # Keep system prompt + last 6 messages (3 turns) to prevent context overflow
+        if len(self.messages) > 7:
+            self.messages = [self.messages[0]] + self.messages[-6:]
+            
         self.messages.append({"role": "user", "content": new_user_content})
         
         options = {
