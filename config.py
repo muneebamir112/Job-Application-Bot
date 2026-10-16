@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Ollama settings
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "35"))
 # Resume parsing and open-ended answers involve much longer prompts/responses
@@ -15,7 +15,7 @@ OLLAMA_LONG_TIMEOUT = int(os.getenv("OLLAMA_LONG_TIMEOUT", "75"))
 # Google Sheet settings
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON", "service_account.json")
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Sheet1")
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Profile1")
 
 # Automation Behavior settings
 AUTO_SUBMIT = os.getenv("AUTO_SUBMIT", "True").lower() in ("true", "1", "yes")
@@ -30,6 +30,16 @@ FILL_REQUIRED_ONLY = os.getenv("FILL_REQUIRED_ONLY", "False").lower() in ("true"
 # successful (see form_filler.fill_and_submit_form) - not before submitting,
 # and never for a Failed/Human Attention/Dry Run outcome.
 SCREENSHOT_ON_SUCCESS = os.getenv("SCREENSHOT_ON_SUCCESS", "True").lower() in ("true", "1", "yes")
+# When True, detect_captcha_or_login_wall always returns (None, "") so the bot
+# skips every captcha/login-wall gate and only fills the form and saves Q&A to Sheet3.
+SKIP_CAPTCHA_CHECK = os.getenv("SKIP_CAPTCHA_CHECK", "False").lower() in ("true", "1", "yes")
+
+# Ollama Backend Mode: "stateless" (FullPromptOllamaClient) or "session" (OllamaJobSession)
+OLLAMA_BACKEND = os.getenv("OLLAMA_BACKEND", "stateless").lower()
+
+# When True, skip uploading resume file into the form
+SKIP_RESUME_UPLOAD = os.getenv("SKIP_RESUME_UPLOAD", "False").lower() in ("true", "1", "yes")
+
 
 # Base paths
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -47,7 +57,8 @@ LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 # RESUME_DIR (which is only used to build the base profile/answers).
 import os
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CVS_DIR = os.path.join(BASE_DIR, "CVs")
+CVS_DIR = os.getenv("RESUMES_SAVE_PATH", os.path.join(BASE_DIR, "CVs"))
+CVS_ALT_DIR = os.path.join(BASE_DIR, "CVs-old")
 
 # Successful-application screenshots are saved to
 # SCREENSHOTS_DIR/<Company Name>/<screenshot>.png - a dedicated Desktop

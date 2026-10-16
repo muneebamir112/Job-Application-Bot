@@ -1,0 +1,155 @@
+[
+  {
+    "company": "Affirm",
+    "question": "Do you now, or will you in the future, require immigration sponsorship to work for Affirm in Canada?",
+    "type": "single_choice",
+    "options": ["Yes", "No"],
+    "expected_category": "sponsorship"
+  },
+  {
+    "company": "Affirm",
+    "question": "Do you require immigration sponsorship to work for Affirm in the United States?",
+    "type": "single_choice",
+    "options": ["Yes", "No"],
+    "expected_category": "sponsorship"
+  },
+  {
+    "company": "Affirm",
+    "question": "Which U.S. State or Canadian Province do you reside in?",
+    "type": "single_choice",
+    "options": ["Texas", "California", "New York", "Washington", "Ontario", "I do not reside in the US or Canada"],
+    "expected_category": "location"
+  },
+  {
+    "company": "ArenaNet",
+    "question": "Which of the following have you used professionally? Select all that apply.",
+    "type": "multi_choice",
+    "options": ["Docker", "PostgreSQL", "MSSQL", "Redis", "Kubernetes", "RabbitMQ or another message queue", "Jenkins or another CI/CD platform", "None of the above"],
+    "expected_category": "skills_multiselect"
+  },
+  {
+    "company": "ArenaNet",
+    "question": "How would you describe your professional experience developing backend systems with Python?",
+    "type": "single_choice",
+    "options": ["None of the above", "Working proficiency", "Strong proficiency", "Advanced/Expert proficiency"],
+    "expected_category": "skill_proficiency"
+  },
+  {
+    "company": "Hungryroot",
+    "question": "How many years of Python experience do you have?",
+    "type": "single_choice",
+    "options": ["0-1 years", "1-3 years", "3-5 years", "5-8 years", "8+ years"],
+    "expected_category": "years_experience"
+  },
+  {
+    "company": "Hungryroot",
+    "question": "Which web frameworks do you have experience in? (IE, Django, FastAPI, Flask, etc)",
+    "type": "text",
+    "options": [],
+    "expected_category": "frameworks_open_ended"
+  },
+  {
+    "company": "BetterHelp",
+    "question": "Which of the following have you used professionally in the last 3 years? Select all that apply.",
+    "type": "multi_choice",
+    "options": [
+      "PHP / Laravel",
+      "React / Next.js",
+      "Another backend language/framework (Python, Node, Ruby, Java, .NET, Go, etc.)",
+      "MySQL or another relational database (schema design, complex queries)",
+      "Third-party API integrations (Stripe, Iterable, CMS platforms, etc.)",
+      "Mobile development (including side projects)",
+      "Agentic AI coding tools (Claude Code, Cursor, etc.)",
+      "None of the above"
+    ],
+    "expected_category": "tech_multiselect"
+  },
+  {
+    "company": "hims & hers",
+    "question": "Are you legally authorized to work in the U.S. without restriction for any employer?",
+    "type": "single_choice",
+    "options": ["Yes", "No"],
+    "expected_category": "work_authorization"
+  },
+  {
+    "company": "hims & hers",
+    "question": "How many years of professional software engineering experience do you have?",
+    "type": "single_choice",
+    "options": ["Less than 5 years", "5-10", "10-12", "12-15"],
+    "expected_category": "years_experience"
+  },
+  {
+    "company": "hims & hers",
+    "question": "What has been your typical split between frontend and backend work throughout your career? (e.g., 30% FE / 70% BE)",
+    "type": "text",
+    "options": [],
+    "expected_category": "engineering_split"
+  },
+  {
+    "company": "Kalepa",
+    "question": "Do you have 8+ years of experience?",
+    "type": "single_choice",
+    "options": ["Yes", "No"],
+    "expected_category": "years_experience"
+  },
+  {
+    "company": "Kalepa",
+    "question": "Do you have experience with AWS?",
+    "type": "single_choice",
+    "options": ["Yes", "No"],
+    "expected_category": "skill_boolean"
+  },
+  {
+    "company": "Kalepa",
+    "question": "What are your salary expectations? (in $)",
+    "type": "text",
+    "options": [],
+    "expected_category": "salary"
+  },
+  {
+    "company": "Nango (YC W23)",
+    "question": "Why are you interested in this position? Please keep it short and honest. 1–3 genuine sentences stand out.",
+    "type": "text",
+    "options": [],
+    "expected_category": "why_company_open_ended"
+  },
+  {
+    "company": "Second Nature",
+    "question": "We require that candidates provide proof of their legal right to work in the United States after hiring. Will you be able to provide this documentation after you are hired?",
+    "type": "single_choice",
+    "options": ["Yes", "No"],
+    "expected_category": "work_auth_proof"
+  },
+  {
+    "company": "Openly",
+    "question": "Will the target salary range listed ($145,600 - $163,800) meet your salary requirements?",
+    "type": "single_choice",
+    "options": ["Yes", "No"],
+    "expected_category": "salary_acceptance"
+  },
+  {
+    "company": "Care Access",
+    "question": "Have you been previously employed by Care Access?",
+    "type": "single_choice",
+    "options": ["Yes", "No"],
+    "expected_category": "prior_employment"
+  },
+  {
+    "company": "Monte Carlo",
+    "question": "Gender Identity",
+    "type": "single_choice",
+    "options": ["Male", "Female", "Decline to self-identify"],
+    "expected_category": "demographics_gender"
+  },
+  {
+    "company": "Monte Carlo",
+    "question": "Protected Veteran Status",
+    "type": "single_choice",
+    "options": [
+      "I identify as one or more of the classifications of protected veteran listed above",
+      "I decline to self-identify for protected veteran status",
+      "I am not a protected veteran"
+    ],
+    "expected_category": "demographics_veteran"
+  }
+]
