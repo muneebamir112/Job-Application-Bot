@@ -16,7 +16,7 @@ class OllamaJobSession:
         self.job_title = job_title
 
         # Strip heavy/irrelevant fields to avoid context overflow
-        _EXCLUDE_KEYS = {"resume_file_path", "resume_text", "cover_letter_text", "cover_letter_file_path"}
+        _EXCLUDE_KEYS = {"resume_file_path", "resume_text", "cover_letter_text", "cover_letter_file_path", "job_description"}
         slim_profile = {k: v for k, v in profile.items() if k not in _EXCLUDE_KEYS}
         profile_json = json.dumps(slim_profile, indent=2, ensure_ascii=False)[:3000]
 

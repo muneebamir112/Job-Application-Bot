@@ -954,7 +954,7 @@ def log_field_decision(job_logger, label: str, classification: str, source: str,
 
 def json_context_string(profile: dict) -> str:
     """Formats the profile details cleanly for Ollama context (excludes bulky/raw fields)."""
-    filtered_profile = {k: v for k, v in profile.items() if k not in ("resume_file_path", "resume_text")}
+    filtered_profile = {k: v for k, v in profile.items() if k not in ("resume_file_path", "resume_text", "job_description")}
     return json.dumps(filtered_profile, indent=2)
 
 
@@ -4692,7 +4692,7 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
     "Human Attention", or "Dry Run" (only when dry_run=True).
     """
     resume_text = (profile.get("resume_text") or "")[:4000]
-    job_logger.ollama_session = OllamaJobSession(profile, resume_text, company, profile.get("job_title", "Unknown Role"))
+    job_logger.ollama_session = OllamaJobSession(profile, resume_text, company, profile.get("job_title", "Unknown Role"), profile.get("job_description", ""))
     field_attempts = {}
     try:
         # Step 1: Navigated page captcha/login check

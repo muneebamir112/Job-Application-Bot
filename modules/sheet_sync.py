@@ -4,6 +4,15 @@ from datetime import datetime
 import config
 from modules.logger import logger
 
+def _col_letter(n):
+    """1-based column number -> letters (1 -> A, 27 -> AA)."""
+    letters = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
 class SheetSync:
     def __init__(self):
         self.scopes = [
@@ -54,13 +63,44 @@ class SheetSync:
             logger.error(f"Failed to load headers from worksheet: {e}")
             raise
 
+    def _read_rows(self):
+        """Data rows (from row 2) at full header width, without downloading the long Job Description column."""
+        d = self.col_indices.get("job description")  # 1-based column number
+        if d is None or d < 2:
+            return self.sheet.get_all_values()[1:]  # old layout: no description column yet
+        d -= 1  # 0-based
+        n = len(self.headers)
+        ranges = [f"A2:{_col_letter(d)}"]
+        if n > d + 1:
+            ranges.append(f"{_col_letter(d + 2)}2:{_col_letter(n)}")
+        parts = self.sheet.batch_get(ranges)
+        left = parts[0]
+        right = parts[1] if len(parts) > 1 else []
+        rows = []
+        for i in range(max(len(left), len(right))):
+            l = list(left[i]) if i < len(left) else []
+            r = list(right[i]) if i < len(right) else []
+            rows.append(l + [""] * (d - len(l)) + [""] + r)
+        return rows
+
+    def get_description(self, row_index: int) -> str:
+        """The job description stored in the sheet for this row ('' if the sheet has none)."""
+        d = self.col_indices.get("job description")
+        if not d:
+            return ""
+        try:
+            return (self.sheet.cell(row_index, d).value or "").strip()
+        except Exception as e:
+            logger.warning(f"Could not read the job description for row {row_index}: {e}")
+            return ""
+
     def get_pending_jobs(self, retry_failed=False, retry_human_attention=False, profiles_to_check=None):
         """
         Reads the sheet and returns a list of jobs that are pending processing.
         Each job is a dict with details, and includes 'row_index' (1-based sheet row)
         and 'profiles_to_apply' which maps a profile name to its column index.
         """
-        all_rows = self.sheet.get_all_values()
+        all_rows = [self.headers] + self._read_rows()
         if len(all_rows) <= 1:
             logger.info("Sheet is empty or only contains headers.")
             return []
