@@ -117,7 +117,7 @@ class SheetSync:
                         is_done = any(s in p_status_lower for s in ("submitted", "applied", "scraped"))
                         should_apply = False
                         if not is_done:
-                            if p_status == "Generated":
+                            if "generated" in p_status_lower and "not generated" not in p_status_lower:
                                 should_apply = True
                             elif getattr(config, "SKIP_RESUME_UPLOAD", False):
                                 should_apply = True
