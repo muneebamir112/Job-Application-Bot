@@ -77,6 +77,22 @@ class SheetSync:
         title_col = self.col_indices.get("job title")
         date_added_col = self.col_indices.get("date added") or self.col_indices.get("date posted")
 
+        # Track which companies each profile has ALREADY applied to across the entire sheet
+        from modules.text_utils import normalize_company
+        self.applied_companies_by_profile = {p.lower(): set() for p in (profiles_to_check or [])}
+        if profiles_to_check and company_col:
+            for r in all_rows[1:]:
+                comp_raw = r[company_col - 1].strip() if len(r) >= company_col else ""
+                norm_c = normalize_company(comp_raw)
+                if not norm_c or norm_c in ("unknown", "n/a", "na", "-"):
+                    continue
+                for p in profiles_to_check:
+                    p_col = self.col_indices.get(p.lower())
+                    if p_col and len(r) >= p_col:
+                        p_status = r[p_col - 1].strip().lower()
+                        if "submitted" in p_status or "applied" in p_status:
+                            self.applied_companies_by_profile[p.lower()].add(norm_c)
+
         # Iterate starting from row 2 (index 1 in all_rows, but 2 in Sheet)
         for index, row in enumerate(all_rows[1:], start=2):
             # Pad row if columns are shorter than headers length
@@ -128,6 +144,16 @@ class SheetSync:
                             elif retry_human_attention and "human attention" in p_status_lower:
                                 should_apply = True
                         
+                        if should_apply:
+                            norm_comp = normalize_company(company)
+                            if norm_comp and norm_comp not in ("unknown", "n/a", "na", "-"):
+                                if norm_comp in self.applied_companies_by_profile.get(profile_name.lower(), set()):
+                                    logger.info(
+                                        f"Row {index}: Skipping profile '{profile_name}' for '{title}' at '{company}' "
+                                        f"— profile has already applied to this company."
+                                    )
+                                    should_apply = False
+
                         if should_apply:
                             profiles_to_apply[profile_name] = p_col
             

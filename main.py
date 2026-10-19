@@ -21,6 +21,7 @@ from modules.logger import logger, log_run_summary, get_job_logger, clean_filena
 from modules.resume_parser import get_or_create_profile
 from modules.sheet_sync import SheetSync
 from modules.form_filler import fill_and_submit_form, wait_for_fields_to_settle
+from modules.text_utils import normalize_company
 
 def resolve_resume_path(company: str, profile_name: str) -> str | None:
     """
@@ -252,6 +253,12 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
     failed_count = 0
     human_attention_count = 0
 
+    # Track companies applied to per profile during this run to prevent duplicate applications to the same company
+    run_applied_companies = {
+        p.lower(): set(getattr(sheet, 'applied_companies_by_profile', {}).get(p.lower(), set()))
+        for p in all_profiles
+    }
+
     try:
         for job in pending_jobs:
             row_idx = job["row_index"]
@@ -268,6 +275,15 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                 if not profile:
                     logger.warning(f"Profile {profile_name} found in sheet but missing JSON data, skipping.")
                     continue
+
+                norm_comp = normalize_company(company)
+                if norm_comp and norm_comp not in ("unknown", "n/a", "na", "-"):
+                    if norm_comp in run_applied_companies.get(profile_name.lower(), set()):
+                        logger.info(
+                            f"Skipping job {row_idx}: '{title}' at '{company}' for '{profile_name}' "
+                            f"— profile has already applied to a job at this company."
+                        )
+                        continue
 
                 logger.info(f"Processing job {row_idx}: {title} at {company} (Profile: {profile_name})...")
                 job_logger, log_path = get_job_logger(company, title, run_timestamp)
@@ -338,6 +354,12 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                     if status == "Submitted":
                         submitted_count += 1
                         job_logger.info("Application submitted successfully!")
+                        if norm_comp and norm_comp not in ("unknown", "n/a", "na", "-"):
+                            run_applied_companies[profile_name.lower()].add(norm_comp)
+                            logger.info(
+                                f"Marked company '{company}' as applied for '{profile_name}'. "
+                                f"Subsequent jobs from this company will be skipped for this profile."
+                            )
                     elif status == "Human Attention":
                         human_attention_count += 1
                         job_logger.warning(f"Requires Human Attention: {reason}")
