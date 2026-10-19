@@ -62,6 +62,25 @@ def resolve_resume_path(company: str, profile_name: str) -> str | None:
         except Exception:
             pass
 
+        # Check profile subfolder (e.g. cv_dir / profile_name)
+        prof_subfolder = os.path.join(cv_dir, profile_name)
+        if os.path.isdir(prof_subfolder):
+            prof_candidates = [
+                os.path.join(prof_subfolder, f"{profile_name} - {company}.pdf"),
+                os.path.join(prof_subfolder, f"{company} - {profile_name}.pdf"),
+                os.path.join(prof_subfolder, f"{company}.pdf"),
+                os.path.join(prof_subfolder, f"{clean_filename(company)}.pdf"),
+            ]
+            for pc in prof_candidates:
+                if os.path.isfile(pc):
+                    return pc
+            try:
+                for f in os.listdir(prof_subfolder):
+                    if f.lower().endswith(".pdf") and (company.lower() in f.lower() or clean_comp in clean_filename(f).lower()):
+                        return os.path.join(prof_subfolder, f)
+            except Exception:
+                pass
+
         # Check flat files in cv_dir
         flat_candidates = [
             os.path.join(cv_dir, f"{profile_name} - {company}.pdf"),
