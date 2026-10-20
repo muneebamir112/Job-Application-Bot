@@ -317,6 +317,7 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
 
                 profile["job_title"] = title
                 profile["company_name"] = company
+                profile["job_description"] = sheet.get_description(row_idx)
 
                 # Create a fresh context and page with auto-healing
                 context = await get_fresh_context()
