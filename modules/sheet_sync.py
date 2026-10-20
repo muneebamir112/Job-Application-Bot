@@ -41,6 +41,10 @@ class SheetSync:
         """Opens the specified worksheet in the Google Sheet."""
         try:
             spreadsheet = self.client.open_by_key(config.GOOGLE_SHEET_ID)
+            target = config.WORKSHEET_NAME.strip().lower()
+            for ws in spreadsheet.worksheets():
+                if ws.title.strip().lower() == target:
+                    return ws
             return spreadsheet.worksheet(config.WORKSHEET_NAME)
         except Exception as e:
             logger.error(f"Failed to open Google Sheet ID '{config.GOOGLE_SHEET_ID}' worksheet '{config.WORKSHEET_NAME}': {e}")
@@ -54,11 +58,12 @@ class SheetSync:
             self.col_indices = {header.strip().lower(): i + 1 for i, header in enumerate(self.headers)}
             
             # Verify required columns are present
-            required_cols = ["company name", "job title", "job link", "date added"]
+            required_cols = ["company name", "job title", "job link"]
             for col in required_cols:
                 if col not in self.col_indices:
-                    # Try fuzzy mapping or create fallback
                     logger.warning(f"Required column '{col}' not found exactly in sheet. Mapping key might fail.")
+            if "date added" not in self.col_indices and "date posted" not in self.col_indices:
+                logger.warning("Neither 'date added' nor 'date posted' found in sheet.")
         except Exception as e:
             logger.error(f"Failed to load headers from worksheet: {e}")
             raise
@@ -110,7 +115,23 @@ class SheetSync:
         link_col = self.col_indices.get("job link")
         company_col = self.col_indices.get("company name")
         title_col = self.col_indices.get("job title")
-        date_added_col = self.col_indices.get("date added")
+        date_added_col = self.col_indices.get("date added") or self.col_indices.get("date posted")
+
+        # Track which companies each profile has ALREADY applied to across the entire sheet
+        from modules.text_utils import normalize_company
+        self.applied_companies_by_profile = {p.lower(): set() for p in (profiles_to_check or [])}
+        if profiles_to_check and company_col:
+            for r in all_rows[1:]:
+                comp_raw = r[company_col - 1].strip() if len(r) >= company_col else ""
+                norm_c = normalize_company(comp_raw)
+                if not norm_c or norm_c in ("unknown", "n/a", "na", "-"):
+                    continue
+                for p in profiles_to_check:
+                    p_col = self.col_indices.get(p.lower())
+                    if p_col and len(r) >= p_col:
+                        p_status = r[p_col - 1].strip().lower()
+                        if "submitted" in p_status or "applied" in p_status:
+                            self.applied_companies_by_profile[p.lower()].add(norm_c)
 
         # Iterate starting from row 2 (index 1 in all_rows, but 2 in Sheet)
         for index, row in enumerate(all_rows[1:], start=2):
@@ -148,14 +169,31 @@ class SheetSync:
                     p_col = self.col_indices.get(profile_name.lower())
                     if p_col and len(row) >= p_col:
                         p_status = row[p_col - 1].strip()
+                        p_status_lower = p_status.lower()
+                        is_done = any(s in p_status_lower for s in ("submitted", "applied", "scraped"))
                         should_apply = False
-                        if p_status == "Generated":
-                            should_apply = True
-                        elif retry_failed and "Failed" in p_status:
-                            should_apply = True
-                        elif retry_human_attention and "Human Attention" in p_status:
-                            should_apply = True
+                        if not is_done:
+                            if "generated" in p_status_lower and "not generated" not in p_status_lower:
+                                should_apply = True
+                            elif getattr(config, "SKIP_RESUME_UPLOAD", False):
+                                should_apply = True
+                            elif p_status in ("", "Pending", "Not Generated"):
+                                should_apply = True
+                            elif retry_failed and "failed" in p_status_lower:
+                                should_apply = True
+                            elif retry_human_attention and "human attention" in p_status_lower:
+                                should_apply = True
                         
+                        if should_apply:
+                            norm_comp = normalize_company(company)
+                            if norm_comp and norm_comp not in ("unknown", "n/a", "na", "-"):
+                                if norm_comp in self.applied_companies_by_profile.get(profile_name.lower(), set()):
+                                    logger.info(
+                                        f"Row {index}: Skipping profile '{profile_name}' for '{title}' at '{company}' "
+                                        f"— profile has already applied to this company."
+                                    )
+                                    should_apply = False
+
                         if should_apply:
                             profiles_to_apply[profile_name] = p_col
             
@@ -214,6 +252,63 @@ class SheetSync:
         except Exception as e:
             logger.error(f"Failed to update sheet row {row_index} col {col_index} profile status: {e}")
 
+    def _get_answers_worksheet(self):
+        """Returns or caches the Sheet3 worksheet for Q&A logging."""
+        if hasattr(self, "_answers_ws") and self._answers_ws is not None:
+            return self._answers_ws
+        try:
+            spreadsheet = self.client.open_by_key(config.GOOGLE_SHEET_ID)
+            for ws in spreadsheet.worksheets():
+                if ws.title.strip().lower() == "sheet3":
+                    self._answers_ws = ws
+                    return ws
+            # Fallback or create if not found
+            self._answers_ws = spreadsheet.worksheet("Sheet3")
+            return self._answers_ws
+        except Exception as e:
+            logger.error(f"Failed to access Sheet3 worksheet: {e}")
+            return None
+
+    def log_single_form_answer(self, profile_name: str, question_with_prompt: str, question: str, answer: str):
+        """
+        Immediately appends a single question and answer to 'Sheet3' while the form is being filled.
+        Ensures questions and answers are captured in real-time even if form filling errors or stops midway.
+        """
+        ANSWERS_SHEET_NAME = "Sheet3"
+        HEADERS = ["profile name", "question with prompt", "question", "answer"]
+
+        clean_q = str(question or "").strip()
+        if not clean_q or "DEBUG_" in clean_q:
+            return
+
+        clean_ans = str(answer or "")
+        if len(clean_ans) > 4000:
+            clean_ans = clean_ans[:3997] + "..."
+
+        try:
+            ws = self._get_answers_worksheet()
+            if not ws:
+                return
+
+            # Write headers if the sheet is completely empty
+            existing = ws.row_values(1)
+            if not existing or not any(existing):
+                ws.append_row(HEADERS)
+                logger.info(f"Wrote headers to '{ANSWERS_SHEET_NAME}'.")
+
+            row = [
+                profile_name,
+                str(question_with_prompt or ""),
+                clean_q,
+                clean_ans,
+            ]
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            logger.info(f"Immediately logged live Q&A to '{ANSWERS_SHEET_NAME}': '{clean_q}'")
+        except Exception as e:
+            # Clear cache on error in case worksheet connection went stale
+            self._answers_ws = None
+            logger.error(f"Failed to log live Q&A to '{ANSWERS_SHEET_NAME}': {e}")
+
     def log_form_answers(self, profile_name: str, ollama_answers: list):
         """
         Appends Ollama generated Q&A to 'Sheet3' in the same Google Sheet.
@@ -228,8 +323,9 @@ class SheetSync:
             return
 
         try:
-            spreadsheet = self.client.open_by_key(config.GOOGLE_SHEET_ID)
-            ws = spreadsheet.worksheet(ANSWERS_SHEET_NAME)
+            ws = self._get_answers_worksheet()
+            if not ws:
+                return
 
             # Write headers if the sheet is completely empty
             existing = ws.row_values(1)
@@ -239,13 +335,16 @@ class SheetSync:
 
             rows = []
             for qa in ollama_answers:
+                question = str(qa.get("question") or "").strip()
+                if not question or "DEBUG_" in question:
+                    continue
                 answer = str(qa.get("answer") or "")
                 if len(answer) > 4000:
                     answer = answer[:3997] + "..."
                 rows.append([
                     profile_name,
                     qa.get("question_with_prompt", qa.get("system_prompt", "")),
-                    qa.get("question", ""),
+                    question,
                     answer,
                 ])
 
@@ -253,4 +352,6 @@ class SheetSync:
             logger.info(f"Logged {len(rows)} form answers to '{ANSWERS_SHEET_NAME}'.")
 
         except Exception as e:
+            self._answers_ws = None
             logger.error(f"Failed to log form answers to '{ANSWERS_SHEET_NAME}': {e}")
+

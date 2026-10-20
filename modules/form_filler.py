@@ -7,6 +7,7 @@ from datetime import datetime
 from playwright.async_api import Page, ElementHandle
 import config
 from modules.ollama_session import OllamaJobSession
+from modules.ollama_stateless.full_prompt_client import FullPromptOllamaClient
 from modules.logger import logger
 from modules.ollama_client import query_ollama
 from modules.captcha_detector import detect_captcha_or_login_wall
@@ -92,6 +93,9 @@ PROFILE_FIELD_SYNONYMS = {
         "which state", "what state", "state do you reside", "state you reside",
         "which state do you reside", "which state do you reside in", "what state do you reside",
         "state of residence", "residence state", "current state", "your state"
+    ],
+    "postal_code": [
+        "zip", "zip*", "zip code", "postal code", "postcode", "zip/postal code", "zip / postal code", "postal", "zipcode"
     ],
     "location": [
         "location", "current location", "residence",
@@ -241,6 +245,26 @@ def get_profile_value(profile: dict, key: str | None) -> str | None:
     if not key:
         return None
 
+    if key in ("full_name", "name"):
+        return profile.get("full_name") or profile.get("name") or None
+
+    if key == "first_name":
+        if profile.get("first_name"):
+            return str(profile.get("first_name")).strip()
+        raw_name = profile.get("name") or profile.get("full_name") or ""
+        parts = raw_name.split()
+        return parts[0] if parts else None
+
+    if key == "last_name":
+        if profile.get("last_name"):
+            return str(profile.get("last_name")).strip()
+        raw_name = profile.get("name") or profile.get("full_name") or ""
+        parts = raw_name.split()
+        return parts[-1] if len(parts) > 1 else None
+
+    if key == "location":
+        return profile.get("location") or profile.get("address") or None
+
     # --- middle_name: personal identity field, never inferred ---
     # If not set in profile, return None so the field is left blank with no
     # Ollama call. This prevents the bot from typing sentences like
@@ -267,7 +291,7 @@ def get_profile_value(profile: dict, key: str | None) -> str | None:
         return profile.get("youtube") or profile.get("YouTube") or profile.get("youtube_url") or profile.get("youtube_profile") or None
 
     if key == "current_company":
-        work_experience = profile.get("work_experience")
+        work_experience = profile.get("work_experience") or profile.get("FIXED_EXPERIENCE")
         if isinstance(work_experience, list) and work_experience:
             company = work_experience[0].get("company") if isinstance(work_experience[0], dict) else None
             return str(company).strip() or None if company else None
@@ -278,19 +302,24 @@ def get_profile_value(profile: dict, key: str | None) -> str | None:
     # e.g. education_degree returns "Bachelor's Degree" not
     # "Bachelor's Degree, Weber State University, 2014".
     if key == "education_degree":
-        edu_list = profile.get("education")
+        edu_list = profile.get("education") or profile.get("FIXED_EDUCATION")
         if isinstance(edu_list, list) and edu_list:
             first = edu_list[0]
             if isinstance(first, dict):
                 return str(first.get("degree", "")).strip() or None
+        elif isinstance(edu_list, dict):
+            deg = edu_list.get("degree") or edu_list.get("degree_line") or ""
+            return str(deg).split(",")[0].strip() or None
         return None
 
     if key == "education_school":
-        edu_list = profile.get("education")
+        edu_list = profile.get("education") or profile.get("FIXED_EDUCATION")
         if isinstance(edu_list, list) and edu_list:
             first = edu_list[0]
             if isinstance(first, dict):
                 return str(first.get("school", "")).strip() or None
+        elif isinstance(edu_list, dict):
+            return str(edu_list.get("school", "")).strip() or None
         return None
 
     if key == "education_major":
@@ -329,24 +358,33 @@ def get_profile_value(profile: dict, key: str | None) -> str | None:
         city_val = profile.get("city")
         if city_val:
             return str(city_val).strip()
-        loc = profile.get("location") or ""
+        loc = profile.get("location") or profile.get("address") or ""
         if "," in loc:
             return loc.split(",")[0].strip()
         return loc.strip() if loc else None
+
+    if key in ("postal_code", "zip", "zipcode"):
+        z = profile.get("postal_code") or profile.get("zip") or profile.get("zip_code")
+        if z:
+            return str(z).strip()
+        loc = (profile.get("location") or profile.get("address") or "").lower()
+        if "haltom city" in loc or "tx" in loc or "texas" in loc:
+            return "76117"
+        return "94105"
 
     if key == "state":
         state_val = profile.get("state")
         if state_val:
             s = str(state_val).strip()
             return US_STATE_CODE_TO_NAME.get(s.lower(), s)
-        loc = profile.get("location") or ""
+        loc = profile.get("location") or profile.get("address") or ""
         if "," in loc:
-            raw_state = loc.split(",")[1].strip()
+            raw_state = loc.split(",")[1].strip().split()[0].strip()
             return US_STATE_CODE_TO_NAME.get(raw_state.lower(), raw_state)
         return None
 
     if key == "country":
-        c = resolve_country_from_location(profile.get("location") or "")
+        c = resolve_country_from_location(profile.get("location") or profile.get("address") or "")
         if c == "US":
             return "United States"
         elif c == "CA":
@@ -751,8 +789,6 @@ ALWAYS_NO_LABEL_KEYWORDS = (
     "have you ever worked at",
     "ever worked for",
     "ever worked at",
-    "worked at",
-    "worked for",
     "require the support of",
     "maintain that authorization",
     "support to maintain",
@@ -945,11 +981,41 @@ def resolve_visa_sponsorship_choice(label_norm: str, options_texts: list[str], p
 
 
 def log_field_decision(job_logger, label: str, classification: str, source: str, value) -> None:
-    """Structured per-field log line: label -> classification -> source -> final value."""
+    """Structured per-field log line: label -> classification -> source -> final value.
+
+    Also writes every answered field to Sheet3 in real-time so the user can see
+    all scraped questions (prompt, question, answer) regardless of whether the
+    answer came from profile.json, a hardcoded rule, or Ollama.
+    Ollama-answered fields are already written inside ask_ollama_open_ended /
+    ask_ollama_choice; we skip them here to avoid double-logging.
+    """
     display_value = value
     if isinstance(display_value, str) and len(display_value) > 120:
         display_value = display_value[:120] + "..."
     job_logger.info(f"[FIELD] label='{label}' classification={classification} source={source} value={display_value!r}")
+
+    # ── Sheet3 live scraping ─────────────────────────────────────────────────
+    # Skip: null/skipped fields, or fields already written by ask_ollama_*
+    # (those write with source starting with "ollama")
+    if value is None:
+        return
+    if isinstance(source, str) and source.lower().startswith("ollama"):
+        return  # already logged inside ask_ollama_open_ended / ask_ollama_choice
+    if isinstance(source, str) and "skipped" in source.lower():
+        return  # deliberately skipped fields add no value to Sheet3
+
+    sheet = getattr(job_logger, "sheet", None)
+    if not sheet:
+        return
+
+    try:
+        p_name = getattr(job_logger, "profile_name", "") or "Candidate"
+        # Build a short, human-readable prompt column for Sheet3
+        prompt_text = f"[{source}] {classification}"
+        answer_str = str(value) if not isinstance(value, bool) else ("Yes" if value else "No")
+        sheet.log_single_form_answer(p_name, prompt_text, label, answer_str)
+    except Exception as _e:
+        job_logger.warning(f"Sheet3 live-log failed for '{label}' ({source}): {_e}")
 
 
 def json_context_string(profile: dict) -> str:
@@ -986,16 +1052,32 @@ async def ask_ollama_open_ended(label: str, profile: dict, job_logger, classific
     label_lower = label.lower()
     if any(kw in label_lower for kw in ("how did you hear", "hear about", "referral", "source of referral", "how did you find")):
         if "n/a" in cleaned.lower() or len(cleaned) <= 3:
-            return "I found this role through LinkedIn while researching opportunities in this space."
+            cleaned = "I found this role through LinkedIn while researching opportunities in this space."
 
     # If the question was asking for a missing URL / link and Ollama replied with N/A, keep it
     if "n/a" in cleaned.lower() and len(cleaned) <= 5:
         is_url = any(kw in label_lower for kw in ("url", "link", "http", "website", "portfolio", "github", "twitter", "blog"))
         if is_url:
-            return "N/A"
-        job_title = profile.get("job_title", "the role")
-        company_name = profile.get("company_name", "the company")
-        return f"I am excited about the {job_title} opportunity at {company_name} and look forward to contributing my technical skills and experience to the team."
+            cleaned = "N/A"
+        else:
+            job_title = profile.get("job_title", "the role")
+            company_name = profile.get("company_name", "the company")
+            cleaned = f"I am excited about the {job_title} opportunity at {company_name} and look forward to contributing my technical skills and experience to the team."
+
+    # Sync back into job_logger.ollama_answers so Sheet3 logs the exact answer typed into the form
+    if hasattr(job_logger, "ollama_answers") and job_logger.ollama_answers:
+        job_logger.ollama_answers[-1]["answer"] = cleaned
+
+    # Immediately log to Sheet3 while the form is being filled
+    if getattr(job_logger, "sheet", None):
+        try:
+            p_name = getattr(job_logger, "profile_name", "") or profile.get("name") or profile.get("full_name") or "Candidate"
+            prompt_text = ""
+            if hasattr(job_logger, "ollama_session"):
+                prompt_text = getattr(job_logger.ollama_session, "sheet_prompt", "")
+            job_logger.sheet.log_single_form_answer(p_name, prompt_text, label, cleaned)
+        except Exception as e:
+            job_logger.warning(f"Live Sheet3 logging failed for '{label}': {e}")
 
     return cleaned
 
@@ -1016,23 +1098,44 @@ async def ask_ollama_choice(label: str, options: list[str], profile: dict, job_l
     # If Ollama wrapped the answer in quotes or brackets, strip them
     cleaned = re.sub(r"^['\"\[]+|['\"\]]+$", "", cleaned).strip()
 
+    final_choice = ""
     # Re-match against actual options to guarantee exact match
     for opt in options:
         if opt.strip().lower() == cleaned.lower():
-            return opt.strip()
+            final_choice = opt.strip()
+            break
 
-    # Fuzzy match as fallback
-    best, score = best_matching_option(cleaned, options)
-    if best and score >= 0.5:
-        return best
+    if not final_choice:
+        # Fuzzy match as fallback
+        best, score = best_matching_option(cleaned, options)
+        if best and score >= 0.5:
+            final_choice = best
 
-    # Ultimate fallback: try to find a valid option that isn't a placeholder
-    if options:
+    if not final_choice and options:
+        # Ultimate fallback: try to find a valid option that isn't a placeholder
         for opt in options:
             if normalize_text(opt) not in _SELECT_PLACEHOLDER_TEXTS:
-                return opt.strip()
-        return options[0]
-    return ""
+                final_choice = opt.strip()
+                break
+        if not final_choice:
+            final_choice = options[0]
+
+    # Sync back into job_logger.ollama_answers so Sheet3 logs the exact choice
+    if hasattr(job_logger, "ollama_answers") and job_logger.ollama_answers:
+        job_logger.ollama_answers[-1]["answer"] = final_choice
+
+    # Immediately log to Sheet3 while the form is being filled
+    if getattr(job_logger, "sheet", None):
+        try:
+            p_name = getattr(job_logger, "profile_name", "") or profile.get("name") or profile.get("full_name") or "Candidate"
+            prompt_text = ""
+            if hasattr(job_logger, "ollama_session"):
+                prompt_text = getattr(job_logger.ollama_session, "sheet_prompt", "")
+            job_logger.sheet.log_single_form_answer(p_name, prompt_text, label, final_choice)
+        except Exception as e:
+            job_logger.warning(f"Live Sheet3 logging failed for choice '{label}': {e}")
+
+    return final_choice
 
 async def ask_ollama_numeric(label: str, profile: dict, job_logger) -> str:
     """Prompt Ollama specifically to output a single numeric integer/decimal."""
@@ -1386,7 +1489,7 @@ async def find_visible_listbox_options(frame, wait_ms: int = LISTBOX_WAIT_MS, el
                                 if (el.offsetWidth > 0 && el.offsetHeight > 0) {
                                     if (el.closest('nav, header, [role="navigation"], .sticky-nav, [class*="header"]')) continue;
                                     const txt = (el.innerText || el.textContent || '').trim();
-                                    if (txt) texts.push(txt);
+                                    if (txt && !txt.toLowerCase().startsWith('loading')) texts.push(txt);
                                 }
                             }
                             if (texts.length > 0) return { selector: sel, texts: texts };
@@ -1424,12 +1527,12 @@ async def find_visible_listbox_options(frame, wait_ms: int = LISTBOX_WAIT_MS, el
                     for (const el of shadowEls) {
                         if (el.closest && el.closest('nav, header, [role="navigation"], .sticky-nav, [class*="header"]')) continue;
                         const txt = (el.innerText || el.textContent || '').trim();
-                        if (txt && txt.length > 0 && txt.length < 200) shadowTexts.push(txt);
+                        if (txt && txt.length > 0 && txt.length < 200 && !txt.toLowerCase().startsWith('loading')) shadowTexts.push(txt);
                     }
                     if (shadowTexts.length > 0) return { selector: '__shadow__', texts: [...new Set(shadowTexts)] };
                     return null;
                 }"""), timeout=0.8)
-                if res and res.get("texts"):
+                if res and res.get("texts") and len(res["texts"]) > 0:
                     return res["texts"], res["selector"], context
             except Exception:
                 pass
@@ -1956,7 +2059,7 @@ async def handle_combobox_field(frame, elem: ElementHandle, label: str, profile:
                         best_text = None
                         score = 0.0
 
-            if not best_text or score < MATCH_THRESHOLD:
+            if (not best_text or score < MATCH_THRESHOLD) and not value and not is_location:
                 choice = await ask_ollama_choice(label, option_texts, profile, job_logger, "CHOICE_FIELD")
                 normalized_best, _ = best_matching_option(choice, option_texts)
                 best_text = normalized_best or choice
@@ -2161,7 +2264,7 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
                 return label_text.strip()
 
         # 3. Check custom element host or enclosing form element container (e.g. spl-checkbox, spl-input, spl-autocomplete, spl-form-element, spl-radio-group)
-                host_label = await element.evaluate("""el => {
+        host_label = await element.evaluate(r"""el => {
             let node = el;
             let hosts = [];
             while (node) {
@@ -2217,12 +2320,7 @@ async def _get_field_label_raw(frame, element: ElementHandle, is_group: bool = F
                 }
             }
             
-            // IF we are here, we found nothing! Let's return a debug string!
-            let debugStr = "DEBUG_NO_LABEL: hosts=" + hosts.length;
-            for (let h of hosts) {
-                debugStr += " | " + (h.tagName || "") + " id=" + (h.id || "");
-            }
-            return debugStr;
+            return '';
         }""")
         if host_label and host_label.strip() and len(re.sub(r'[*:\s]', '', host_label.strip())) > 0:
             return host_label.strip()
@@ -2670,7 +2768,28 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
             job_logger.error(f"Failed to fill text field '{label}': {e}")
             return False
 
-    if any(kw in label_norm for kw in ALWAYS_NO_LABEL_KEYWORDS):
+    if any(kw in label_norm for kw in ("date available", "available date", "start date", "earliest start", "when can you start")):
+        try:
+            today_str = datetime.now().strftime("%m/%d/%Y")
+            await set_field_value(elem, today_str, frame=frame, label=label)
+            log_field_decision(job_logger, label, classification, "hardcoded-rule (date available -> today)", today_str)
+            return True
+        except Exception as e:
+            job_logger.error(f"Failed to fill date available field '{label}': {e}")
+            return False
+
+    if any(kw in label_norm for kw in ("desired pay", "desired salary", "expected salary", "salary expectation", "target salary")):
+        try:
+            val_pay = "140000"
+            await set_field_value(elem, val_pay, frame=frame, label=label)
+            log_field_decision(job_logger, label, classification, "hardcoded-rule (desired pay -> 140000)", val_pay)
+            return True
+        except Exception as e:
+            job_logger.error(f"Failed to fill desired pay field '{label}': {e}")
+            return False
+
+    is_link_or_url_request = any(w in label_norm for w in ("url", "link", "share a link", "http", "website"))
+    if not is_link_or_url_request and any(kw in label_norm for kw in ALWAYS_NO_LABEL_KEYWORDS):
         try:
             await set_field_value(elem, "No", frame=frame, label=label)
             log_field_decision(job_logger, label, classification, "hardcoded-rule (always no text)", "No")
@@ -2781,11 +2900,19 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
                 is_req = "*" in label or "required" in label.lower()
 
             if is_req:
-                first_name = profile.get("first_name") or (profile.get("full_name") or "").split()[0] or "candidate"
-                last_name = profile.get("last_name") or ((profile.get("full_name") or "").split()[-1] if len((profile.get("full_name") or "").split()) > 1 else "")
+                raw_name = profile.get("first_name") or profile.get("name") or profile.get("full_name") or ""
+                parts = raw_name.split()
+                first_name = profile.get("first_name") or (parts[0] if parts else "candidate")
+                last_name = profile.get("last_name") or (parts[-1] if len(parts) > 1 else "")
                 name_slug = f"{first_name.lower()}-{last_name.lower()}".strip("-")
                 
-                if matched_key == "linkedin" or "linkedin" in label_norm:
+                if matched_key in ("full_name", "name"):
+                    value = profile.get("name") or profile.get("full_name") or f"{first_name} {last_name}".strip()
+                elif matched_key == "first_name":
+                    value = first_name
+                elif matched_key == "last_name":
+                    value = last_name
+                elif matched_key == "linkedin" or "linkedin" in label_norm:
                     value = f"https://www.linkedin.com/in/{name_slug}"
                 elif matched_key == "github" or "github" in label_norm:
                     value = f"https://github.com/{first_name.lower()}{last_name.lower()}"
@@ -4450,10 +4577,13 @@ async def process_form_fields(frame, profile: dict, job_logger, resume_already_u
                 _, matched_key = classify_field(label, "combobox", profile)
                 await handle_combobox_field(frame, elem, label, profile, job_logger, matched_key, field_attempts)
             elif kind == "file":
-                uploaded = await handle_file_upload(elem, label, profile, job_logger, resume_already_uploaded=resume_uploaded)
-                if uploaded and not ("cover letter" in label_lower or "cover_letter" in label_lower):
-                    resume_uploaded = True
-                await wait_for_fields_to_settle(frame, timeout_ms=3000)
+                if getattr(config, "SKIP_RESUME_UPLOAD", False):
+                    job_logger.info(f"Skipping file upload '{label}' (SKIP_RESUME_UPLOAD=True)")
+                else:
+                    uploaded = await handle_file_upload(elem, label, profile, job_logger, resume_already_uploaded=resume_uploaded)
+                    if uploaded and not ("cover letter" in label_lower or "cover_letter" in label_lower):
+                        resume_uploaded = True
+                    await wait_for_fields_to_settle(frame, timeout_ms=3000)
             elif kind == "radio":
                 await fill_radio_group(frame, extra, label, profile, job_logger, field_attempts)
             elif kind == "radiogroup":
@@ -4685,12 +4815,15 @@ async def _save_screenshot(page: Page, company: str, job_link: str, job_logger, 
         job_logger.warning(f"Saving screenshot '{prefix}' failed: {e}")
 
 
-async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: str, job_link: str, dry_run: bool = False) -> tuple[str, str]:
+async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: str, job_link: str, dry_run: bool = False, sheet=None, profile_name: str = "") -> tuple[str, str]:
     """
     Main orchestration loop for navigating and filling a single job application.
     Returns (status, reason). status is one of "Submitted", "Failed",
     "Human Attention", or "Dry Run" (only when dry_run=True).
     """
+    job_logger.sheet = sheet
+    job_logger.profile_name = profile_name
+    job_logger.dry_run = dry_run
     resume_text = (profile.get("resume_text") or "")[:4000]
     job_logger.ollama_session = OllamaJobSession(profile, resume_text, company, profile.get("job_title", "Unknown Role"), profile.get("job_description", ""))
     field_attempts = {}
@@ -5096,8 +5229,8 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                         return fbe.status, fbe.reason
 
                 if total_fields_filled_across_steps == 0:
-                    job_logger.warning("No form fields detected on Step 1. Waiting up to 60 seconds for a form to load or for manual intervention to open the form...")
-                    for _ in range(30):
+                    job_logger.warning("No form fields detected on Step 1. Waiting briefly for a form to load...")
+                    for _ in range(8):
                         await asyncio.sleep(2)
                         
                         block_status, block_reason = await detect_captcha_or_login_wall(page)
@@ -5144,8 +5277,8 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
                             return fbe.status, fbe.reason
 
                     if total_fields_filled_across_steps == 0:
-                        job_logger.error("Still no form fields detected after 60 seconds. Aborting.")
-                        return "Expired", "Page not found or expired"
+                        job_logger.warning("Still no application form fields detected. Skipping to next job.")
+                        return "No Form Fields", "No fillable application form fields found"
 
             # Check if there is a next step
             clicked_next = await find_and_click_next_button(frame, fields_found)

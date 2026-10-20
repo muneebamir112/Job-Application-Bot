@@ -29,7 +29,7 @@ The candidate profile, tailored resume, job description, and application rules p
 Maintain consistency with previous answers. However, never treat a previous answer as proof of a candidate fact if that answer conflicts with the candidate profile or resume.
 Never invent experience, skills, employment history, education, certifications, years of experience, authorization, demographic information, or other facts.
 If a question asks for information that is not supported by the candidate profile or resume, follow the application's predefined fallback rules.
-Answer only the current application question. Do not include markdown, explanations, or introductory text. Output the exact answer only.
+Answer only the current application question. Provide direct answers without any thinking process. Do not include markdown, explanations, or introductory text. Output the exact answer only.
 
 CANDIDATE PROFILE:
 {profile_json}
@@ -51,6 +51,23 @@ CRITICAL INSTRUCTION FOR OPEN-ENDED: When answering open-ended questions, always
         self.messages = [{"role": "system", "content": system_prompt.strip()}]
         self.host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
         self.model = config.OLLAMA_MODEL
+
+        # Clean, loggable prompt stored in Sheet3 col-B (no raw JSON/resume blobs).
+        # Matches the format: "You are the candidate applying for this job..."
+        self.sheet_prompt = (
+            f"You are the candidate applying for this job. "
+            f"The Candidate Profile and Resume provided are YOUR personal background, YOUR experience, and YOUR identity. "
+            f"You MUST answer the question in the first person ('I', 'my', 'me'). "
+            f"NEVER refer to 'the candidate', 'the profile', 'the resume', or yourself as an AI. "
+            f"If a question asks for something not explicitly stated in your background, use your intelligence and professional judgment to deduce a reasonable, realistic answer as if you were this person. "
+            f"IMPORTANT: Only reply with EXACTLY 'N/A' if the question asks for a specific factual URL or account link (like a Twitter/GitHub URL) that is completely missing from the profile. "
+            f"For ALL other questions — including subjective, experience-based, preference, or opinion questions — you MUST write a proper first-person answer. "
+            f"NEVER reply N/A to those. Keep your answer concise, professional, and specific (2-4 sentences). "
+            f"This answer is typed directly into a plain-text form field, so write in plain prose only: no markdown, no **bold**, no headers, no bullet points, or asterisks. "
+            f"You are applying for the '{job_title}' position at '{company}'. "
+            f"If the question or answer references the role or company, use those exact names. "
+            f"Never output placeholder text like [Company]."
+        )
 
 
     async def _chat_with_ollama(self, new_user_content: str, temperature: float = 0.1, num_predict: int = None) -> str:
@@ -97,7 +114,7 @@ CRITICAL INSTRUCTION FOR OPEN-ENDED: When answering open-ended questions, always
         prompt = f"Application question:\n\n{question}\n\nAnswer according to the candidate context. Do not include markdown, prefixes, or explanations."
         job_logger.info(f"--- OLLAMA SESSION PROMPT FOR '{question}' ---\nUser: {prompt}\n----------------------------------")
         
-        answer = await self._chat_with_ollama(prompt, temperature=0.7, num_predict=200)
+        answer = await self._chat_with_ollama(prompt, temperature=0.7, num_predict=600)
         
         # Clean answer
         cleaned = answer.replace('"', '').strip()
@@ -106,9 +123,15 @@ CRITICAL INSTRUCTION FOR OPEN-ENDED: When answering open-ended questions, always
         
         job_logger.info(f"--- OLLAMA SESSION RESPONSE FOR '{question}' ---\nRaw: {answer}\nCleaned: {cleaned}\n------------------------------------")
         
+        # question_with_prompt stores the clean sheet prompt so Sheet3 col-B shows
+        # the human-readable "You are the candidate applying for this job..." context.
         if not hasattr(job_logger, "ollama_answers"):
             job_logger.ollama_answers = []
-        job_logger.ollama_answers.append({"question_with_prompt": prompt, "question": question, "answer": cleaned, "system_prompt": self.messages[0]['content'][:1000] + "..."})
+        job_logger.ollama_answers.append({
+            "question_with_prompt": self.sheet_prompt,
+            "question": question,
+            "answer": cleaned,
+        })
         return cleaned
 
     async def ask_choice(self, question: str, options: list, job_logger) -> str:
@@ -116,7 +139,7 @@ CRITICAL INSTRUCTION FOR OPEN-ENDED: When answering open-ended questions, always
         prompt = f"Application question:\n\n{question}\n\nAvailable options:\n{options_str}\n\nReturn ONLY the exact text of one of the available options. Do not explain."
         job_logger.info(f"--- OLLAMA SESSION PROMPT (CHOICE) FOR '{question}' ---\nUser: {prompt}\n----------------------------------")
         
-        answer = await self._chat_with_ollama(prompt, temperature=0.0, num_predict=50)
+        answer = await self._chat_with_ollama(prompt, temperature=0.0, num_predict=300)
         cleaned = answer.replace('"', '').strip()
         
         # If Ollama returned empty (context overflow or model failure), use keyword fallback
@@ -134,9 +157,15 @@ CRITICAL INSTRUCTION FOR OPEN-ENDED: When answering open-ended questions, always
         
         job_logger.info(f"--- OLLAMA SESSION RESPONSE (CHOICE) FOR '{question}' ---\nRaw: {answer}\nCleaned: {cleaned}\n------------------------------------")
         
+        # question_with_prompt stores the clean sheet prompt so Sheet3 col-B shows
+        # the human-readable "You are the candidate applying for this job..." context.
         if not hasattr(job_logger, "ollama_answers"):
             job_logger.ollama_answers = []
-        job_logger.ollama_answers.append({"question_with_prompt": prompt, "question": question, "answer": cleaned, "system_prompt": self.messages[0]['content'][:1000] + "..."})
+        job_logger.ollama_answers.append({
+            "question_with_prompt": self.sheet_prompt,
+            "question": question,
+            "answer": cleaned,
+        })
         return cleaned
     
     def save_transcript(self, logs_dir: str):

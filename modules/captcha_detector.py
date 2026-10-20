@@ -1,5 +1,6 @@
 import asyncio
 import re
+import config
 from modules.logger import logger
 
 async def detect_captcha_or_login_wall(page) -> tuple[str | None, str]:
@@ -8,6 +9,9 @@ async def detect_captcha_or_login_wall(page) -> tuple[str | None, str]:
     Returns (status, reason) if detected, otherwise (None, "").
     Uses 100% non-blocking URL inspection and high-speed in-page DOM evaluation (<5ms).
     Never calls frame.frame_element() to guarantee zero Playwright CDP hangs.
+
+    When config.SKIP_CAPTCHA_CHECK is True, always returns (None, "") immediately,
+    letting the bot fill forms and log Q&A to Sheet3 without any blocking.
     """
     # Extract raw Playwright page if browser-use wraps it
     p_page = page
@@ -17,6 +21,18 @@ async def detect_captcha_or_login_wall(page) -> tuple[str | None, str]:
         p_page = page.get_playwright_page()
     elif hasattr(page, '_page'):
         p_page = page._page
+
+    # --- 0. Always check for Login/Registration walls (password fields) ---
+    # Even if SKIP_CAPTCHA_CHECK is True, a password wall means no public application form exists
+    try:
+        for frame in p_page.frames:
+            if await frame.locator("input[type='password']").count() > 0:
+                return "Sign In Required", "Login/Registration wall detected (password field present in frame)"
+    except Exception:
+        pass
+
+    if getattr(config, "SKIP_CAPTCHA_CHECK", False):
+        return None, ""
 
     # --- 1. Instantaneous CAPTCHA challenge frame URL check (0ms, zero CDP calls) ---
     try:
@@ -101,7 +117,7 @@ async def detect_captcha_or_login_wall(page) -> tuple[str | None, str]:
                         if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) continue;
                         const rect = el.getBoundingClientRect();
                         if (rect.left < -100 || rect.top < -100) continue;
-                        // reCAPTCHA v3 badge is bottom-right corner — small (< 70px wide) and not a challenge
+                        // reCAPTCHA v3 badge is bottom-right corner - small (< 70px wide) and not a challenge
                         // Only skip if it has 'grecaptcha-badge' class specifically (the floating badge)
                         if (el.classList.contains('grecaptcha-badge')) continue;
 
