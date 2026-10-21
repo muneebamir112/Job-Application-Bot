@@ -9,8 +9,8 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "35"))
 # Resume parsing and open-ended answers involve much longer prompts/responses
-# than a quick dropdown/checkbox pick - give those a reasonable allowance.
-OLLAMA_LONG_TIMEOUT = int(os.getenv("OLLAMA_LONG_TIMEOUT", "75"))
+# than a quick dropdown/checkbox pick - give those a reasonable allowance (300s for CPU).
+OLLAMA_LONG_TIMEOUT = int(os.getenv("OLLAMA_LONG_TIMEOUT", "300"))
 
 # Google Sheet settings
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")

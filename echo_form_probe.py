@@ -140,8 +140,13 @@ async def dismiss_overlays(page):
     selectors = [
         "button:has-text('Accept All')",
         "button:has-text('Accept all cookies')",
+        "button:has-text('Accept All Cookies')",
+        "button:has-text('Accept all')",
         "button:has-text('Accept Cookies')",
+        "button:has-text('Allow all cookies')",
+        "button:has-text('Allow All')",
         "button:has-text('I agree')",
+        "button:has-text('I Agree')",
         "button:has-text('Got it')",
         "button:has-text('Dismiss')",
         "button[aria-label='Close']",
@@ -153,6 +158,7 @@ async def dismiss_overlays(page):
                 if await el.is_visible():
                     await el.click(timeout=1500)
                     await asyncio.sleep(0.5)
+                    break
         except Exception:
             pass
 

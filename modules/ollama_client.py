@@ -15,7 +15,9 @@ def query_ollama(prompt: str, system_prompt: str = "", timeout: int = None, opti
     payload = {
         "model": config.OLLAMA_MODEL,
         "prompt": prompt,
-        "stream": False
+        "stream": False,
+        "think": False,
+        "keep_alive": "10m"
     }
     if system_prompt:
         payload["system"] = system_prompt

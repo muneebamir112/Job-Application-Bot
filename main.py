@@ -23,18 +23,22 @@ from modules.sheet_sync import SheetSync
 from modules.form_filler import fill_and_submit_form, wait_for_fields_to_settle
 from modules.text_utils import normalize_company
 
-def resolve_resume_path(company: str, profile_name: str) -> str | None:
+def resolve_resume_path(company: str, profile_name: str, job_title: str = "") -> str | None:
     """
     Finds candidate resume tailored for the company or fallback.
     Checks:
-    1. Folder with company name inside CVS_DIR or CVS_ALT_DIR (exact or clean):
+    1. Folder with candidate's profile_name inside CVS_DIR (e.g. CVs/Brian Moore/):
+       - {company} - {job_title}.pdf
+       - {clean_company} - {clean_title}.pdf
+       - any other PDF matching company and job title
+    2. Folder with company name inside CVS_DIR or CVS_ALT_DIR (exact or clean):
        - {profile_name}.pdf
        - any other .pdf in that folder
-    2. Flat file in CVS_DIR or CVS_ALT_DIR:
+    3. Flat file in CVS_DIR or CVS_ALT_DIR:
        - {profile_name} - {company}.pdf
        - {company} - {profile_name}.pdf
        - any PDF containing both profile_name and company
-    3. Base candidate profile resumes:
+    4. Base candidate profile resumes:
        - profiles/{profile_name}.pdf
        - resume-bot/profiles/{profile_name}.pdf
        - resume/resume_default.pdf.pdf
@@ -45,8 +49,42 @@ def resolve_resume_path(company: str, profile_name: str) -> str | None:
             search_dirs.append(d)
 
     clean_comp = clean_filename(company).lower()
+    clean_title = clean_filename(job_title).lower() if job_title else ""
 
     for cv_dir in search_dirs:
+        # Check profile subfolder first (e.g. cv_dir / profile_name / Company - Job title.pdf)
+        prof_subfolder = os.path.join(cv_dir, profile_name)
+        if os.path.isdir(prof_subfolder):
+            clean_c = clean_filename(company)
+            clean_t = clean_filename(job_title) if job_title else ""
+            prof_candidates = []
+            if clean_t:
+                prof_candidates.extend([
+                    os.path.join(prof_subfolder, f"{clean_c} - {clean_t}.pdf"),
+                    os.path.join(prof_subfolder, f"{company} - {job_title}.pdf"),
+                ])
+            prof_candidates.extend([
+                os.path.join(prof_subfolder, f"{profile_name} - {company}.pdf"),
+                os.path.join(prof_subfolder, f"{company} - {profile_name}.pdf"),
+                os.path.join(prof_subfolder, f"{company}.pdf"),
+                os.path.join(prof_subfolder, f"{clean_c}.pdf"),
+            ])
+            for pc in prof_candidates:
+                if os.path.isfile(pc):
+                    return pc
+            try:
+                entries = [f for f in os.listdir(prof_subfolder) if f.lower().endswith(".pdf")]
+                if clean_t:
+                    for f in entries:
+                        f_low = f.lower()
+                        if (clean_comp in clean_filename(f).lower() or company.lower() in f_low) and (clean_title in clean_filename(f).lower() or job_title.lower() in f_low):
+                            return os.path.join(prof_subfolder, f)
+                for f in entries:
+                    if company.lower() in f.lower() or clean_comp in clean_filename(f).lower():
+                        return os.path.join(prof_subfolder, f)
+            except Exception:
+                pass
+
         # Check folders inside cv_dir
         try:
             for entry in os.listdir(cv_dir):
@@ -62,25 +100,6 @@ def resolve_resume_path(company: str, profile_name: str) -> str | None:
                             return match_pdf
         except Exception:
             pass
-
-        # Check profile subfolder (e.g. cv_dir / profile_name)
-        prof_subfolder = os.path.join(cv_dir, profile_name)
-        if os.path.isdir(prof_subfolder):
-            prof_candidates = [
-                os.path.join(prof_subfolder, f"{profile_name} - {company}.pdf"),
-                os.path.join(prof_subfolder, f"{company} - {profile_name}.pdf"),
-                os.path.join(prof_subfolder, f"{company}.pdf"),
-                os.path.join(prof_subfolder, f"{clean_filename(company)}.pdf"),
-            ]
-            for pc in prof_candidates:
-                if os.path.isfile(pc):
-                    return pc
-            try:
-                for f in os.listdir(prof_subfolder):
-                    if f.lower().endswith(".pdf") and (company.lower() in f.lower() or clean_comp in clean_filename(f).lower()):
-                        return os.path.join(prof_subfolder, f)
-            except Exception:
-                pass
 
         # Check flat files in cv_dir
         flat_candidates = [
@@ -116,13 +135,54 @@ def resolve_resume_path(company: str, profile_name: str) -> str | None:
 
 async def dismiss_overlays(page, logger):
     """Attempt to find and click common cookie consent / overlay dismiss buttons."""
+    dismiss_js = """() => {
+        let dismissed = false;
+        const selectors = [
+            '#onetrust-accept-btn-handler', '#onetrust-pc-btn-handler',
+            'button#onetrust-accept-btn-handler', '.onetrust-close-btn-handler',
+            '#onetrust-banner-sdk button', '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+            '#CybotCookiebotDialogBodyButtonAccept', '#CybotCookiebotDialogBodyLevelButtonAccept',
+            '#didomi-notice-agree-button', '.osano-cm-accept-all', '.osano-cm-button--type_save',
+            '#truste-consent-button', '.trustarc-agree-btn', '[data-testid="uc-accept-all-button"]',
+            '#axeptio_btn_acceptAll', 'button.cm-btn-success', 'button.cm-btn-accept',
+            'button.cky-btn-accept', '.cc-btn.cc-allow', '.cc-btn.cc-dismiss',
+            'button[id*="cookie-accept" i]', 'button[id*="accept-cookie" i]',
+            'button[class*="cookie-accept" i]', 'button[class*="accept-cookie" i]',
+            'button[id*="accept-all" i]', 'button[class*="accept-all" i]'
+        ];
+        for (const s of selectors) {
+            try {
+                const el = document.querySelector(s);
+                if (el && (el.offsetParent !== null || el.getBoundingClientRect().height > 0)) {
+                    el.click();
+                    dismissed = true;
+                    break;
+                }
+            } catch (e) {}
+        }
+        return dismissed;
+    }"""
+    try:
+        if await page.evaluate(dismiss_js):
+            logger.info("Dismissed cookie consent banner via CMP selector.")
+            await asyncio.sleep(0.5)
+    except Exception:
+        pass
+
     selectors = [
+        "button:has-text('Accept all cookies')",
+        "button:has-text('Accept All Cookies')",
+        "button:has-text('Accept all')",
         "button:has-text('Accept All')",
-        "button:has-text('I Agree')",
-        "button:has-text('Allow Cookies')",
         "button:has-text('Accept Cookies')",
+        "button:has-text('Allow all cookies')",
+        "button:has-text('Allow All')",
+        "button:has-text('I Agree')",
+        "button:has-text('I agree')",
+        "button:has-text('Allow Cookies')",
         "button:has-text('Got it')",
         "button:has-text('Accept')",
+        "a:has-text('Accept all cookies')",
         "a:has-text('Accept')",
         "a:has-text('I Agree')",
         "[aria-label='Close']",
@@ -138,15 +198,15 @@ async def dismiss_overlays(page, logger):
     
     for selector in selectors:
         try:
-            # Quick check if any matching element is visible
             elements = await page.locator(selector).all()
             for el in elements:
                 if await el.is_visible():
                     logger.info(f"Dismissing overlay using selector: {selector}")
-                    await el.click(timeout=3000)
-                    await asyncio.sleep(1) # wait a moment for animation to finish
+                    await el.click(timeout=2000)
+                    await asyncio.sleep(0.5)
+                    break
         except Exception:
-            pass # ignore errors if elements don't exist or become detached
+            pass
 
 async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool = False, num_profiles: int = 0, specific_profile: str = ""):
     logger.info("Initializing Job Application Automation Bot...")
@@ -290,7 +350,7 @@ async def run_bot(retry_failed: bool, retry_human_attention: bool, dry_run: bool
                 job_logger.info(f"Starting application: {title} at {company} for {profile_name}")
                 job_logger.info(f"URL: {link}")
 
-                resume_path_to_use = resolve_resume_path(company, profile_name)
+                resume_path_to_use = resolve_resume_path(company, profile_name, title)
                 scrape_only_mode = False  # True when no resume exists — bot still fills & scrapes Q&A
 
                 if resume_path_to_use:
