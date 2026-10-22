@@ -34,8 +34,21 @@ SCREENSHOT_ON_SUCCESS = os.getenv("SCREENSHOT_ON_SUCCESS", "True").lower() in ("
 # skips every captcha/login-wall gate and only fills the form and saves Q&A to Sheet3.
 SKIP_CAPTCHA_CHECK = os.getenv("SKIP_CAPTCHA_CHECK", "False").lower() in ("true", "1", "yes")
 
-# Ollama Backend Mode: "stateless" (FullPromptOllamaClient) or "session" (OllamaJobSession)
-OLLAMA_BACKEND = os.getenv("OLLAMA_BACKEND", "stateless").lower()
+# Answer engine for AI-answered form fields: "legacy" (OllamaJobSession) or "v2" (modules/answer_engine:
+# fact sheet + job description in a cached prompt, checked answers, never-blank failure ladder).
+# The model and host are always OLLAMA_MODEL / OLLAMA_HOST above.
+def _env_bool(name, default):
+    return os.getenv(name, str(default)).lower() in ("true", "1", "yes")
+
+ANSWER_ENGINE = os.getenv("ANSWER_ENGINE", "legacy").lower()
+ANSWER_THINK = _env_bool("ANSWER_THINK", False)                   # model thinking (slower, no measured quality gain)
+ANSWER_NUM_CTX = int(os.getenv("ANSWER_NUM_CTX", "8192"))
+ANSWER_TEMPERATURE = float(os.getenv("ANSWER_TEMPERATURE", "0.7"))
+ANSWER_NUM_PREDICT = int(os.getenv("ANSWER_NUM_PREDICT", "300"))
+ANSWER_KEEP_ALIVE = os.getenv("ANSWER_KEEP_ALIVE", "30m")
+ANSWER_MAX_ATTEMPTS = int(os.getenv("ANSWER_MAX_ATTEMPTS", "2"))
+ANSWER_FACTS_SOURCE = os.getenv("ANSWER_FACTS_SOURCE", "auto").lower()   # auto | json | pdf | profile
+ANSWER_AUDIT = _env_bool("ANSWER_AUDIT", True)                    # write answers.jsonl + fact_sheet.txt in the job log folder
 
 # When True, skip uploading resume file into the form
 SKIP_RESUME_UPLOAD = os.getenv("SKIP_RESUME_UPLOAD", "False").lower() in ("true", "1", "yes")
@@ -69,3 +82,6 @@ SCREENSHOTS_DIR = os.path.join(BASE_DIR, "Job Application Screenshots")
 # Ensure necessary directories exist
 os.makedirs(RESUME_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
+
+# Where resume-bot saves the structured tailored resume (<company>_<profile>_ollama.json); the answer engine reads facts from it.
+ANSWER_RESUME_DATA_DIR = os.getenv("ANSWER_RESUME_DATA_DIR", os.path.join(BASE_DIR, "resume-bot", "data"))

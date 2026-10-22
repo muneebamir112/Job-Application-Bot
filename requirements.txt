@@ -11,3 +11,6 @@ requests
 pandas
 python-dotenv
 langchain-ollama
+
+aiohttp
+openpyxl
