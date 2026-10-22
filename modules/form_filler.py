@@ -7,7 +7,7 @@ from datetime import datetime
 from playwright.async_api import Page, ElementHandle
 import config
 from modules.ollama_session import OllamaJobSession
-from modules.ollama_stateless.full_prompt_client import FullPromptOllamaClient
+from modules.answer_engine import AnswerEngine, engine_settings, v2_enabled
 from modules.logger import logger
 from modules.ollama_client import query_ollama
 from modules.captcha_detector import detect_captcha_or_login_wall
@@ -1004,6 +1004,10 @@ def log_field_decision(job_logger, label: str, classification: str, source: str,
     if isinstance(source, str) and "skipped" in source.lower():
         return  # deliberately skipped fields add no value to Sheet3
 
+    engine = getattr(job_logger, "answer_engine", None)
+    if engine is not None:
+        engine.remember(label, value)   # rule/profile answers become "form so far" memory for the AI
+
     sheet = getattr(job_logger, "sheet", None)
     if not sheet:
         return
@@ -1024,10 +1028,28 @@ def json_context_string(profile: dict) -> str:
     return json.dumps(filtered_profile, indent=2)
 
 
+def _log_engine_answer_to_sheet(job_logger, profile: dict, label: str, result) -> None:
+    """Sheet3 row for a v2 answer: column B carries route/via/cited ids (the real prompt is in answers.jsonl)."""
+    if not getattr(job_logger, "sheet", None):
+        return
+    try:
+        p_name = getattr(job_logger, "profile_name", "") or profile.get("name") or profile.get("full_name") or "Candidate"
+        job_logger.sheet.log_single_form_answer(p_name, result.tag(), label, result.text)
+    except Exception as e:
+        job_logger.warning(f"Live Sheet3 logging failed for '{label}': {e}")
+
+
 async def ask_ollama_open_ended(label: str, profile: dict, job_logger, classification: str) -> str:
     """The only call site allowed to generate a free-text Ollama answer for a form field."""
     assert classification == "OPEN_ENDED", "Ollama may only produce free text for OPEN_ENDED fields"
-    
+
+    engine = getattr(job_logger, "answer_engine", None)
+    if engine is not None:
+        result = await engine.answer_open(label)
+        job_logger.info(f"[v2] '{label}' -> {result.tag()} attempts={len(result.attempts)} calls={len(result.calls)} secs={result.elapsed_s}")
+        _log_engine_answer_to_sheet(job_logger, profile, label, result)
+        return result.text
+
     if hasattr(job_logger, "ollama_session"):
         cleaned = await job_logger.ollama_session.ask_open_ended(label, job_logger)
     else:
@@ -1085,7 +1107,14 @@ async def ask_ollama_open_ended(label: str, profile: dict, job_logger, classific
 async def ask_ollama_choice(label: str, options: list[str], profile: dict, job_logger, classification: str) -> str:
     """Ollama is given the list of rendered options and must pick one."""
     assert classification == "CHOICE_FIELD", "Ollama choice picker may only run for CHOICE_FIELD"
-    
+
+    engine = getattr(job_logger, "answer_engine", None)
+    if engine is not None:
+        result = await engine.answer_choice(label, options)
+        job_logger.info(f"[v2] choice '{label}' -> {result.tag()} -> {result.text!r}")
+        _log_engine_answer_to_sheet(job_logger, profile, label, result)
+        return result.text
+
     if hasattr(job_logger, "ollama_session"):
         cleaned = await job_logger.ollama_session.ask_choice(label, options, job_logger)
     else:
@@ -1139,6 +1168,13 @@ async def ask_ollama_choice(label: str, options: list[str], profile: dict, job_l
 
 async def ask_ollama_numeric(label: str, profile: dict, job_logger) -> str:
     """Prompt Ollama specifically to output a single numeric integer/decimal."""
+    engine = getattr(job_logger, "answer_engine", None)
+    if engine is not None:
+        result = await engine.answer_numeric(label)
+        job_logger.info(f"[v2] numeric '{label}' -> {result.tag()} -> {result.text!r}")
+        _log_engine_answer_to_sheet(job_logger, profile, label, result)
+        return result.text
+
     profile_context = json_context_string(profile)
     system_prompt = (
         "You are the candidate applying for this job. The Candidate Profile provided is YOUR personal background and YOUR identity. "
@@ -2912,6 +2948,8 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
                     value = first_name
                 elif matched_key == "last_name":
                     value = last_name
+                elif v2_enabled() and (matched_key in ("linkedin", "github", "portfolio", "website") or any(w in label_norm for w in ("linkedin", "github", "portfolio", "website"))):
+                    value = "N/A"   # v2: never build a link from the candidate's name
                 elif matched_key == "linkedin" or "linkedin" in label_norm:
                     value = f"https://www.linkedin.com/in/{name_slug}"
                 elif matched_key == "github" or "github" in label_norm:
@@ -2996,7 +3034,10 @@ async def fill_text_field(frame, elem: ElementHandle, label: str, profile: dict,
                     return False
             
             # Non-URL open-ended questions should not be left empty
-            if any(term in label_lower for term in ["how did you hear", "hear about", "referral", "source"]):
+            if getattr(job_logger, "answer_engine", None) is not None:
+                from modules.answer_engine.ladder import summary_sentence
+                val = summary_sentence(job_logger.answer_engine)   # v2: a true profile sentence, never a canned one
+            elif any(term in label_lower for term in ["how did you hear", "hear about", "referral", "source"]):
                 val = "LinkedIn"
             else:
                 val = "I am enthusiastic about this role and look forward to contributing my technical skills."
@@ -3718,7 +3759,10 @@ async def _resolve_checkbox_state(label: str, profile: dict, job_logger) -> tupl
 
         # No usable profile-derived yes/no signal for this checkbox - fall back
         # to Ollama deciding check/uncheck (still not free text, just a binary state)
-        if hasattr(job_logger, "ollama_session"):
+        if getattr(job_logger, "answer_engine", None) is not None:
+            result = await job_logger.answer_engine.answer_choice(f"Should I check this checkbox? Label: {label}", ["Yes", "No"])
+            should_check = "yes" in result.text.lower()
+        elif hasattr(job_logger, "ollama_session"):
             answer = await job_logger.ollama_session.ask_choice(f"Should I check this checkbox? Label: {label}", ["Yes", "No"], job_logger)
             should_check = "yes" in answer.lower()
         else:
@@ -4825,7 +4869,13 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
     job_logger.profile_name = profile_name
     job_logger.dry_run = dry_run
     resume_text = (profile.get("resume_text") or "")[:4000]
-    job_logger.ollama_session = OllamaJobSession(profile, resume_text, company, profile.get("job_title", "Unknown Role"), profile.get("job_description", ""))
+    if v2_enabled():
+        # v2: full resume + full job description go into one cached prompt (no 4000/3000/2000/500 char cuts)
+        job_logger.answer_engine = await AnswerEngine.create(
+            profile, profile.get("resume_text") or "", company, profile.get("job_title", "Unknown Role"),
+            profile.get("job_description", ""), profile_name, engine_settings())
+    else:
+        job_logger.ollama_session = OllamaJobSession(profile, resume_text, company, profile.get("job_title", "Unknown Role"), profile.get("job_description", ""))
     field_attempts = {}
     try:
         # Step 1: Navigated page captcha/login check
@@ -5556,6 +5606,11 @@ async def fill_and_submit_form(page: Page, profile: dict, job_logger, company: s
         job_logger.error(f"Exception occurred during form filling: {e}\nTraceback:\n{tb}")
         return "Failed", f"Exception: {e}"
     finally:
+        if getattr(job_logger, "answer_engine", None) is not None and getattr(job_logger, "handlers", None):
+            try:
+                job_logger.answer_engine.save_audit(os.path.dirname(job_logger.handlers[0].baseFilename))
+            except Exception:
+                pass
         if hasattr(job_logger, "ollama_session") and hasattr(job_logger, "handlers") and job_logger.handlers:
             import os
             try:

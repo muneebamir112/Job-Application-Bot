@@ -74,3 +74,16 @@ Fill out the variables inside `.env`:
      ```bash
      python main.py --dry-run
      ```
+
+## Answer engine v2 (grounded AI answers)
+
+Set `ANSWER_ENGINE=v2` in `.env` to answer AI-routed form fields with `modules/answer_engine/` instead of the legacy session
+(default is `legacy`; set it back to roll back). The model and host are still `OLLAMA_MODEL` / `OLLAMA_HOST`.
+
+- The full resume (as a numbered fact sheet) and the full job description go into one cached prompt per application.
+- The AI replies as JSON and cites the fact IDs it used; every sentence is checked in code against those facts.
+- A field is never left blank: retry, salvage, restate a real resume line, then the profile summary sentence.
+  Link fields with no profile value get `N/A` (never an invented URL).
+- `answers.jsonl` and `fact_sheet.txt` are written to the job's log folder (what the AI saw, what it cited, why it was accepted).
+- v2 handles every AI-answered field: open-ended text, dropdown/radio/checkbox choices and numeric answers (the rules and profile steps run first, as before).
+- Other settings: `ANSWER_THINK`, `ANSWER_NUM_CTX`, `ANSWER_TEMPERATURE`, `ANSWER_NUM_PREDICT`, `ANSWER_KEEP_ALIVE`, `ANSWER_MAX_ATTEMPTS`, `ANSWER_FACTS_SOURCE`, `ANSWER_RESUME_DATA_DIR`, `ANSWER_AUDIT`.
