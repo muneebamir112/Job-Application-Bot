@@ -7,7 +7,8 @@ Reads the jobs sheet (and the question lists) from an Excel workbook, replays ev
     Benchmark Summary  one row per model (green/yellow, blanks, fallbacks, speed)
 No browser is opened and nothing is written to Sheet3. Your .env is never changed: the model is overridden per run.
 
-Every question goes straight to the v2 answer engine (no bot form rules, no browser) with the chosen model.\n\nUsage (from the Job-Bot folder):
+Every question goes straight to the v2 answer engine (no bot form rules, no browser) with the chosen model.\n\nUsage (from the Job-Bot folder), with a local Excel file OR a Google Sheet link:
+    python benchmark/run_benchmark.py --sheet-url "https://docs.google.com/spreadsheets/d/<id>/edit" --profile "Brian Moore" --models qwen3:1.7b,qwen3.5:4b
     python benchmark/run_benchmark.py --excel "C:/path/Jobs.xlsx" --profile "Brian Moore" --models qwen3:1.7b,qwen2.5:3b
 Options: --jobs-sheet Jobs  --docs-dir <folder with the saved question docs>  --think  --force  --jobs 1,2,5  --keep-loaded
 """
@@ -117,30 +118,110 @@ def find_question_file(job: dict, docs_dir: str, excel_dir: str) -> str | None:
     return None
 
 
-def load_jobs(wb, args, excel_dir: str) -> list[dict]:
-    ws = wb[args.jobs_sheet]
+def load_jobs(jobs_rows: list[dict], questions_rows: list[dict], args, base_dir: str, doc_fetcher=None) -> list[dict]:
     questions_sheet = {}
-    if "Questions" in wb.sheetnames:                          # optional: columns "Job ID" / "Question"
-        for r in read_table(wb["Questions"]):
-            jid, q = pick(r, "Job ID", "No", "No."), pick(r, "Question")
-            if jid is not None and q:
-                key = str(int(jid)) if isinstance(jid, (int, float)) else str(jid).strip()
-                questions_sheet.setdefault(key, []).append(str(q).strip())
+    for r in questions_rows or []:                            # optional "Questions" tab: columns "Job ID" / "Question"
+        jid, q = pick(r, "Job ID", "No", "No."), pick(r, "Question")
+        if jid is not None and q:
+            key = str(int(jid)) if isinstance(jid, (int, float)) else str(jid).strip()
+            questions_sheet.setdefault(key, []).append(str(q).strip())
     jobs = []
-    for n, r in enumerate(read_table(ws), 1):
+    for n, r in enumerate(jobs_rows, 1):
         jid = pick(r, "No.", "No", "Job ID", "ID")
-        jid = str(int(jid)) if isinstance(jid, (int, float)) else str(jid or n)
+        jid = str(int(jid)) if isinstance(jid, (int, float)) else str(jid or n).strip()
         job = {"id": jid, "company": str(pick(r, "Company Name", "Company") or "").strip(), "title": str(pick(r, "Job Title", "Title") or "").strip(),
                "jd": str(pick(r, "Job Description", "Description") or ""), "profile": str(pick(r, "Profile", "Profile Name") or args.profile or "").strip(),
                "resume": pick(r, "Resume", "Resume Path", "Resume File"), "_row": r}
-        qfile = find_question_file(job, args.docs_dir, excel_dir)
-        job["questions"] = questions_sheet.get(jid) or (read_question_file(qfile) if qfile else [])
-        job["questions_source"] = "Questions sheet" if questions_sheet.get(jid) else (qfile or "NOT FOUND")
+        qfile = find_question_file(job, args.docs_dir, base_dir)
+        link = pick(r, "Questions Doc Link", "Questions Link")
+        if questions_sheet.get(jid):
+            job["questions"], job["questions_source"] = questions_sheet[jid], "Questions tab"
+        elif qfile:
+            job["questions"], job["questions_source"] = read_question_file(qfile), qfile
+        elif link and doc_fetcher:
+            try:
+                job["questions"], job["questions_source"] = parse_questions(doc_fetcher(str(link)).splitlines()), f"Google Doc {link}"
+            except Exception as e:
+                job["questions"], job["questions_source"] = [], f"Google Doc FAILED: {e}"
+        else:
+            job["questions"], job["questions_source"] = [], "NOT FOUND"
         jobs.append(job)
     if args.jobs:
         keep = {j.strip() for j in args.jobs.split(",")}
         jobs = [j for j in jobs if j["id"] in keep]
     return jobs
+
+
+# ------------------------------------------------------------------ Google Sheets / Docs (optional: --sheet-url)
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+
+def google_credentials():
+    from google.oauth2.service_account import Credentials
+    path = config.SERVICE_ACCOUNT_JSON
+    for p in (path, os.path.join(ROOT, path)):
+        if os.path.isfile(p):
+            return Credentials.from_service_account_file(p, scopes=GOOGLE_SCOPES)
+    raise SystemExit(f"Service account file '{path}' not found (set SERVICE_ACCOUNT_JSON in .env). It is the same file the bot uses.")
+
+
+def make_doc_fetcher(creds):
+    """Returns a function(link) -> plain text of a Google Doc: the service account first (doc shared with it), then the public export link."""
+    from google.auth.transport.requests import AuthorizedSession
+    session = AuthorizedSession(creds)
+
+    def fetch(link: str) -> str:
+        m = re.search(r"/document/d/([\w-]+)", link)
+        if not m:
+            raise ValueError("not a Google Doc link")
+        did, errs = m.group(1), []
+        r = session.get(f"https://www.googleapis.com/drive/v3/files/{did}/export", params={"mimeType": "text/plain"}, timeout=60)
+        if r.status_code == 200:
+            return r.content.decode("utf-8", "ignore").lstrip("\ufeff")
+        errs.append(f"service account: HTTP {r.status_code}")
+        r = requests.get(f"https://docs.google.com/document/d/{did}/export?format=txt", timeout=60)
+        if r.status_code == 200 and "<html" not in r.text[:200].lower():
+            return r.text.lstrip("\ufeff")
+        errs.append(f"public link: HTTP {r.status_code}")
+        raise RuntimeError("; ".join(errs) + " - share the doc with the service account email or with 'anyone with the link'")
+    return fetch
+
+
+def google_table(ws) -> list[dict]:
+    values = ws.get_all_values()
+    if not values:
+        return []
+    head = [h.strip() for h in values[0]]
+    return [{head[i]: r[i] for i in range(min(len(head), len(r))) if head[i] and r[i] != ""} for r in values[1:] if any(c != "" for c in r)]
+
+
+def _rgb(hexcolor: str) -> dict:
+    h = hexcolor[-6:]
+    return {"red": int(h[0:2], 16) / 255, "green": int(h[2:4], 16) / 255, "blue": int(h[4:6], 16) / 255}
+
+
+def write_google(spreadsheet, wb_tmp) -> None:
+    """Copy the three result sheets (built with openpyxl) into tabs of the Google spreadsheet. Only tabs named Benchmark* are touched."""
+    import gspread
+    for name in SHEETS:
+        src = wb_tmp[name] if name in wb_tmp.sheetnames else None
+        if src is None:
+            continue
+        values = [["" if c.value is None else (str(c.value)[:45000] if isinstance(c.value, str) else c.value) for c in row] for row in src.iter_rows()]
+        try:
+            spreadsheet.del_worksheet(spreadsheet.worksheet(name))
+        except gspread.WorksheetNotFound:
+            pass
+        ws = spreadsheet.add_worksheet(title=name, rows=max(len(values) + 5, 20), cols=max(len(values[0]) if values else 1, 5))
+        ws.update(values, "A1", value_input_option="RAW")
+        fmts = [{"range": "1:1", "format": {"textFormat": {"bold": True}, "wrapStrategy": "WRAP"}},
+                {"range": f"A2:{gspread.utils.rowcol_to_a1(len(values), len(values[0]))}", "format": {"wrapStrategy": "WRAP", "verticalAlignment": "TOP"}}]
+        for row in src.iter_rows(min_row=2):
+            for c in row:
+                if c.fill is not None and c.fill.fill_type == "solid" and c.fill.fgColor.rgb not in (None, "00000000"):
+                    fmts.append({"range": c.coordinate, "format": {"backgroundColor": _rgb(str(c.fill.fgColor.rgb))}})
+        ws.batch_format(fmts)
+        ws.freeze(rows=1)
 
 
 # ------------------------------------------------------------------ profile + resume
@@ -316,10 +397,22 @@ def save_workbook(wb, path: str) -> str:
         return alt
 
 
+def publish(wb, spreadsheet, excel, cache, jobs, models) -> str:
+    if spreadsheet is not None:                      # Google mode: build the sheets in a scratch workbook, then copy them into the Google tabs
+        tmp = Workbook()
+        write_sheets(tmp, cache, jobs, models)
+        write_google(spreadsheet, tmp)
+        return spreadsheet.url
+    write_sheets(wb, cache, jobs, models)
+    return save_workbook(wb, excel)
+
+
 # ------------------------------------------------------------------ main
 async def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--excel", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--excel", help="path to an .xlsx file (results are added as sheets in the same file)")
+    src.add_argument("--sheet-url", help="link to a Google Sheet shared with the bot's service account (results are added as tabs in the same sheet)")
     ap.add_argument("--models", required=True, help="comma-separated Ollama model names, e.g. qwen3:1.7b,qwen2.5:3b")
     ap.add_argument("--profile", default="", help="profile name (profiles/<name>.json) when the jobs sheet has no Profile column")
     ap.add_argument("--jobs-sheet", default="Jobs")
@@ -330,17 +423,38 @@ async def main():
     ap.add_argument("--keep-loaded", action="store_true", help="do not unload each model from memory when it finishes")
     args = ap.parse_args()
 
-    excel = os.path.abspath(args.excel)
-    excel_dir = os.path.dirname(excel)
-    cache_path = os.path.splitext(excel)[0] + ".benchmark.json"
-    backup = os.path.splitext(excel)[0] + ".backup.xlsx"
-    if not os.path.exists(backup):
-        shutil.copy2(excel, backup)
-        print(f"Backed up the workbook to {backup}")
-    wb = load_workbook(excel)
-    if args.jobs_sheet not in wb.sheetnames:
-        raise SystemExit(f"Sheet '{args.jobs_sheet}' not found. Sheets: {wb.sheetnames}")
-    jobs = load_jobs(wb, args, excel_dir)
+    spreadsheet = doc_fetcher = None
+    if args.sheet_url:
+        import gspread
+        m = re.search(r"/spreadsheets/d/([\w-]+)", args.sheet_url)
+        sheet_id = m.group(1) if m else args.sheet_url.strip()
+        creds = google_credentials()
+        spreadsheet = gspread.authorize(creds).open_by_key(sheet_id)
+        doc_fetcher = make_doc_fetcher(creds)
+        titles = [w.title for w in spreadsheet.worksheets()]
+        if args.jobs_sheet not in titles:
+            raise SystemExit(f"Tab '{args.jobs_sheet}' not found. Tabs: {titles}")
+        jobs_rows = google_table(spreadsheet.worksheet(args.jobs_sheet))
+        questions_rows = google_table(spreadsheet.worksheet("Questions")) if "Questions" in titles else []
+        base_dir = os.getcwd()
+        stem_path = os.path.join(ROOT, "benchmark", f"google_{sheet_id[:12]}")
+        cache_path, audits_dir, excel = stem_path + ".benchmark.json", stem_path + "_audits", None
+        print(f"Google Sheet '{spreadsheet.title}' ({len(jobs_rows)} job rows)")
+    else:
+        excel = os.path.abspath(args.excel)
+        base_dir = os.path.dirname(excel)
+        cache_path = os.path.splitext(excel)[0] + ".benchmark.json"
+        audits_dir = os.path.splitext(excel)[0] + "_audits"
+        backup = os.path.splitext(excel)[0] + ".backup.xlsx"
+        if not os.path.exists(backup):
+            shutil.copy2(excel, backup)
+            print(f"Backed up the workbook to {backup}")
+        wb = load_workbook(excel)
+        if args.jobs_sheet not in wb.sheetnames:
+            raise SystemExit(f"Sheet '{args.jobs_sheet}' not found. Sheets: {wb.sheetnames}")
+        jobs_rows = read_table(wb[args.jobs_sheet])
+        questions_rows = read_table(wb["Questions"]) if "Questions" in wb.sheetnames else []
+    jobs = load_jobs(jobs_rows, questions_rows, args, base_dir, doc_fetcher)
     print(f"{len(jobs)} job(s):")
     for j in jobs:
         print(f"  #{j['id']} {j['company']} - {j['title']}: {len(j['questions'])} question(s) [{j['questions_source']}] profile='{j['profile'] or '?'}'")
@@ -352,7 +466,6 @@ async def main():
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     have = installed_models()
     cache = json.load(open(cache_path, encoding="utf-8")) if os.path.exists(cache_path) else {}
-    audits_dir = os.path.splitext(excel)[0] + "_audits"
     all_models = list(dict.fromkeys(list(cache.keys()) + models))
 
     for model in models:
@@ -368,17 +481,14 @@ async def main():
             if not job["questions"] or job["id"] in done:
                 continue
             print(f" job #{job['id']} {job['company']} ({len(job['questions'])} questions)")
-            rows = await run_job(job, model, args, excel_dir, audits_dir)
+            rows = await run_job(job, model, args, base_dir, audits_dir)
             cache.setdefault(model, []).extend(rows)
             json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)     # resumable after every job
         print(f" model {model} finished in {round(time.time() - t0)}s")
         if not args.keep_loaded:
             unload(model)
-        write_sheets(wb, cache, jobs, all_models)
-        out = save_workbook(wb, excel)
-        print(f" results saved to {out}")
-    write_sheets(wb, cache, jobs, all_models)
-    print(f"\nDone. Open '{save_workbook(wb, excel)}' -> sheets: {', '.join(SHEETS)}")
+        print(f" results saved to {publish(wb, spreadsheet, excel, cache, jobs, all_models)}")
+    print(f"\nDone. Open '{publish(wb, spreadsheet, excel, cache, jobs, all_models)}' -> sheets: {', '.join(SHEETS)}")
 
 
 if __name__ == "__main__":
